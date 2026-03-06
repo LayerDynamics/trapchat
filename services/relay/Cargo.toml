@@ -1,0 +1,21 @@
+[package]
+name = "trapchat-relay"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+trapchat-io = { path = "../../pkgs/rust/io" }
+trapchat-protocol = { path = "../../pkgs/rust/protocol" }

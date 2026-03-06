@@ -1,0 +1,13 @@
+[package]
+name = "trapchat-io"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
