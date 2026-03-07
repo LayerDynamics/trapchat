@@ -758,7 +758,8 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			Type    string `json:"type"`
 			Payload string `json:"payload"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+        r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
+        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
