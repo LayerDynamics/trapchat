@@ -18,8 +18,8 @@ const MAGIC_BYTES = {
 
 function sanitizeFileName(name) {
   if (!name || typeof name !== 'string') return 'file';
-  // Strip path separators and null bytes to prevent path traversal
-  return name.replace(/[/\\:\0]/g, '_').slice(0, 255);
+  // Strip path separators, null bytes, and collapse '..' to prevent path traversal
+  return name.replace(/\.\./g, '').replace(/[/\\:\0]/g, '_').slice(0, 255) || 'file';
 }
 
 function detectMimeType(file, bytes) {
@@ -167,6 +167,15 @@ export class MediaAssembler {
     if (transfer.received === transfer.total) {
       // Reassemble
       const totalSize = transfer.chunks.reduce((sum, c) => sum + c.length, 0);
+
+      // Enforce file size limit on reassembled data (sender's fileSize field is untrusted)
+      if (totalSize > MAX_FILE_SIZE) {
+        clearTimeout(this.#timers.get(transferId));
+        this.#timers.delete(transferId);
+        this.#transfers.delete(transferId);
+        return { error: true, transferId, message: `[media rejected — exceeds ${MAX_FILE_SIZE / 1024 / 1024}MB limit]` };
+      }
+
       const assembled = new Uint8Array(totalSize);
       let offset = 0;
       for (const c of transfer.chunks) {

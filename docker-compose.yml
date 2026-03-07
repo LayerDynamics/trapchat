@@ -3,8 +3,8 @@ services:
     build:
       context: .
       dockerfile: services/gateway/Dockerfile
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     environment:
       - GATEWAY_PORT=8080
       - RELAY_URL=ws://relay:9000
@@ -27,9 +27,9 @@ services:
     build:
       context: .
       dockerfile: services/relay/Dockerfile
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    expose:
+      - "9000"
+      - "9001"
     environment:
       - RELAY_ADDR=0.0.0.0:9000
       - RELAY_HEALTH_ADDR=0.0.0.0:9001
@@ -46,8 +46,8 @@ services:
     build:
       context: services/worker
       dockerfile: Dockerfile
-    ports:
-      - "9100:9100"
+    expose:
+      - "9100"
     environment:
       - WORKER_PORT=9100
       - ALLOWED_CALLBACK_HOSTS=localhost,127.0.0.1,gateway

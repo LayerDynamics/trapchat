@@ -124,7 +124,9 @@ export async function importKey(base64) {
 
 /**
  * KeyRotator manages periodic key rotation for a room.
- * When rotated, the old key is kept briefly to decrypt in-flight messages.
+ * On rotation, the caller MUST broadcast the new key (encrypted under the old key)
+ * to all peers via the onRotate callback. Peers call acceptKey() when they receive it.
+ * The previous key is kept for a 30s grace period to decrypt in-flight messages.
  */
 export class KeyRotator {
   #currentKey = null;
@@ -136,7 +138,8 @@ export class KeyRotator {
   /**
    * @param {object} opts
    * @param {number} opts.interval - Rotation interval in ms (default: 30 min)
-   * @param {function} opts.onRotate - Called with (newKey, exportedKey) after rotation
+   * @param {function} opts.onRotate - Called with (newKey, exportedKey, oldKey) after rotation.
+   *   The caller MUST broadcast exportedKey encrypted under oldKey to all peers.
    */
   constructor({ interval, onRotate } = {}) {
     this.#interval = interval || 30 * 60 * 1000;
@@ -164,12 +167,23 @@ export class KeyRotator {
     return this.#previousKey;
   }
 
-  async #rotate() {
+  /** Accept a rotated key received from a peer's broadcast (does not trigger onRotate) */
+  acceptKey(key) {
     this.#previousKey = this.#currentKey;
+    this.#currentKey = key;
+    // Clear previous key after grace period
+    setTimeout(() => {
+      this.#previousKey = null;
+    }, 30000);
+  }
+
+  async #rotate() {
+    const oldKey = this.#currentKey;
+    this.#previousKey = oldKey;
     this.#currentKey = await generateRoomKey();
     const exported = await exportKey(this.#currentKey);
     if (this.#onRotate) {
-      this.#onRotate(this.#currentKey, exported);
+      this.#onRotate(this.#currentKey, exported, oldKey);
     }
     // Clear previous key after 30s grace period for in-flight messages
     setTimeout(() => {
@@ -196,11 +210,11 @@ export class KeyRotator {
   /** Try decrypting bytes with current key, fall back to previous key */
   async decryptBytes(ciphertext) {
     try {
-      return await decryptBytesRaw(this.#currentKey, ciphertext);
+      return await decryptBytes(this.#currentKey, ciphertext);
     } catch {
       if (this.#previousKey) {
         try {
-          return await decryptBytesRaw(this.#previousKey, ciphertext);
+          return await decryptBytes(this.#previousKey, ciphertext);
         } catch {
           // Both keys failed
         }
@@ -210,5 +224,3 @@ export class KeyRotator {
   }
 }
 
-// Internal alias so KeyRotator can reference the module-level decryptBytes
-const decryptBytesRaw = decryptBytes;
