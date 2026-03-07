@@ -39,6 +39,31 @@ function detectMimeType(file, bytes) {
   return 'application/octet-stream';
 }
 
+/**
+ * Validate a claimed MIME type against the actual file bytes.
+ * If the claimed type doesn't match the magic bytes, fall back to detected type.
+ */
+function validateMimeType(claimedMime, bytes) {
+  if (!claimedMime || bytes.length < 8) return 'application/octet-stream';
+
+  // Detect actual type from magic bytes
+  for (const [mime, sig] of Object.entries(MAGIC_BYTES)) {
+    if (!sig) continue;
+    if (sig.every((b, i) => bytes[i] === b)) {
+      // If claimed type matches a known type but magic bytes say otherwise, use detected
+      return claimedMime === mime ? claimedMime : mime;
+    }
+  }
+
+  // MP4 check
+  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    return 'video/mp4';
+  }
+
+  // No magic bytes matched — use octet-stream for safety instead of trusting claimed type
+  return 'application/octet-stream';
+}
+
 export async function sendMedia(client, key, room, file, onProgress) {
   if (file.size > MAX_FILE_SIZE) {
     throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max is 25MB.`);
@@ -188,13 +213,16 @@ export class MediaAssembler {
       this.#timers.delete(transferId);
       this.#transfers.delete(transferId);
 
-      const blob = new Blob([assembled], { type: transfer.mimeType });
+      // Validate claimed MIME type against actual file content (magic bytes)
+      const validatedMime = validateMimeType(transfer.mimeType, assembled);
+
+      const blob = new Blob([assembled], { type: validatedMime });
       const url = URL.createObjectURL(blob);
 
       return {
         complete: true,
         transferId,
-        mimeType: transfer.mimeType,
+        mimeType: validatedMime,
         fileName: transfer.fileName,
         fileSize: transfer.fileSize,
         url,
