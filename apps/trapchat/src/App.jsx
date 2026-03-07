@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import QRCode from 'qrcode'
 import { TrapChatClient } from './socket/client.js'
-import { generateRoomKey, exportKey, importKey, encrypt, decrypt } from './lib/crypto.js'
+import { generateRoomKey, exportKey, importKey, encrypt, decrypt, deriveRoomKey } from './lib/crypto.js'
 import './App.css'
 
 const MAX_MESSAGES = 500
+const MAX_ROOM_NAME_LEN = 64
 
 function App() {
   const [view, setView] = useState('join')
@@ -16,10 +18,25 @@ function App() {
   const bottomRef = useRef(null)
   const unsubsRef = useRef([])
   const clientRef = useRef(null)
+  const [passphrase, setPassphrase] = useState('')
   const [shareLink, setShareLink] = useState('')
   const [copied, setCopied] = useState(false)
+  const [showQR, setShowQR] = useState(false)
+  const [qrDataURL, setQrDataURL] = useState('')
   // Track whether disconnect was intentional to avoid conflicting with reconnect
   const intentionalDisconnectRef = useRef(false)
+
+  // Generate QR code data URL when share link changes
+  useEffect(() => {
+    if (shareLink) {
+      QRCode.toDataURL(shareLink, { width: 200, margin: 2 })
+        .then(url => setQrDataURL(url))
+        .catch(() => setQrDataURL(''))
+    } else {
+      setQrDataURL('')
+      setShowQR(false)
+    }
+  }, [shareLink])
 
   const copyShareLink = useCallback(async () => {
     try {
@@ -86,7 +103,8 @@ function App() {
 
   const joinRoom = useCallback(async (e) => {
     e.preventDefault()
-    if (!room.trim()) return
+    const trimmed = room.trim()
+    if (!trimmed || trimmed.length > MAX_ROOM_NAME_LEN) return
 
     const client = getClient()
     intentionalDisconnectRef.current = false
@@ -96,8 +114,13 @@ function App() {
       // If a key fragment was provided via URL hash, import it
       // Otherwise, generate a random room key and build a shareable link
       if (typeof keyRef.current === 'string' && keyRef.current) {
-        // Key fragment provided via URL hash — import it directly
+        // Key fragment provided via URL hash — import it then clear from browser history
         keyRef.current = await importKey(keyRef.current)
+        // Remove key from URL to prevent leaking via browser history/bookmarks
+        history.replaceState(null, '', window.location.pathname)
+      } else if (passphrase.trim()) {
+        // Passphrase provided — derive a deterministic key from room + passphrase
+        keyRef.current = await deriveRoomKey(room, passphrase)
       } else {
         // No shared key in URL — generate a random key and share via URL fragment
         const key = await generateRoomKey()
@@ -165,7 +188,7 @@ function App() {
       setStatus('error')
       console.error('connection failed:', err)
     }
-  }, [room])
+  }, [room, passphrase, appendMessage])
 
   const sendMessage = useCallback(async (e) => {
     e.preventDefault()
@@ -196,7 +219,7 @@ function App() {
       queued: !sent,
     })
     setInput('')
-  }, [input, room])
+  }, [input, room, appendMessage])
 
   const leaveRoom = useCallback(() => {
     const client = getClient()
@@ -225,7 +248,15 @@ function App() {
             onChange={(e) => setRoom(e.target.value)}
             placeholder="enter room name"
             aria-label="Room name"
+            maxLength={MAX_ROOM_NAME_LEN}
             autoFocus
+          />
+          <input
+            type="password"
+            value={passphrase}
+            onChange={(e) => setPassphrase(e.target.value)}
+            placeholder="passphrase (optional)"
+            aria-label="Room passphrase"
           />
           <button type="submit">join</button>
         </form>
@@ -237,19 +268,37 @@ function App() {
   return (
     <div className="container chat-container" role="main">
       <header className="chat-header">
+        <span className={`status-dot ${status === 'connected' ? 'green' : status.startsWith('reconnecting') ? 'yellow' : 'red'}`} aria-label={`Connection status: ${status}`} />
         <span className="room-name">#{room}</span>
         <span className="peer-count" aria-live="polite">{peerCount} online</span>
         <button onClick={leaveRoom} className="leave-btn" aria-label="Leave room">leave</button>
       </header>
       {shareLink && (
-        <button
-          type="button"
-          className={`share-bar ${copied ? 'copied' : ''}`}
-          onClick={copyShareLink}
-          aria-label="Copy share link to clipboard"
-        >
-          {copied ? 'copied!' : 'share link (click to copy)'}
-        </button>
+        <div className="share-section">
+          <button
+            type="button"
+            className={`share-bar ${copied ? 'copied' : ''}`}
+            onClick={copyShareLink}
+            aria-label="Copy share link to clipboard"
+          >
+            {copied ? 'copied!' : 'share link (click to copy)'}
+          </button>
+          {qrDataURL && (
+            <button
+              type="button"
+              className="qr-toggle"
+              onClick={() => setShowQR(prev => !prev)}
+              aria-label={showQR ? 'Hide QR code' : 'Show QR code'}
+            >
+              {showQR ? 'hide QR' : 'show QR'}
+            </button>
+          )}
+          {showQR && qrDataURL && (
+            <div className="qr-container">
+              <img src={qrDataURL} alt="Room share QR code" className="qr-code" />
+            </div>
+          )}
+        </div>
       )}
       <div className="messages" role="log" aria-live="polite" aria-label="Chat messages">
         {messages.map(msg => (

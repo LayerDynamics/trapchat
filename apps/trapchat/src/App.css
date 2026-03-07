@@ -75,6 +75,7 @@ h1 {
 
 .join-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5em;
   width: 100%;
   max-width: 400px;
@@ -243,4 +244,61 @@ h1 {
   background: var(--error-bg);
   color: var(--error-text);
   border: 1px solid var(--error-border);
+}
+
+/* Connection status dot */
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.status-dot.green {
+  background: #22c55e;
+  box-shadow: 0 0 4px #22c55e;
+}
+
+.status-dot.yellow {
+  background: #eab308;
+  box-shadow: 0 0 4px #eab308;
+}
+
+.status-dot.red {
+  background: #ef4444;
+  box-shadow: 0 0 4px #ef4444;
+}
+
+/* QR code */
+.share-section {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.qr-toggle {
+  width: 100%;
+  padding: 0.3em;
+  font-size: 0.8em;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.qr-toggle:hover {
+  color: var(--text-primary);
+}
+
+.qr-container {
+  display: flex;
+  justify-content: center;
+  padding: 1em;
+  background: #fff;
+}
+
+.qr-code {
+  width: 200px;
+  height: 200px;
 }

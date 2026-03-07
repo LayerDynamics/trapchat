@@ -1,5 +1,6 @@
 const MAX_RECONNECT_DELAY = 30000;
 const BASE_RECONNECT_DELAY = 1000;
+const MAX_RECONNECT_ATTEMPTS = 20;
 
 export class TrapChatClient {
   #ws = null;
@@ -77,7 +78,7 @@ export class TrapChatClient {
       this.#lastRoom = null;
     }
 
-    const msg = JSON.stringify({ type, room, payload, timestamp: Date.now() });
+    const msg = JSON.stringify({ id: crypto.randomUUID(), type, room, payload, timestamp: Date.now() });
 
     if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
       // Queue chat/media messages for delivery after reconnect
@@ -118,6 +119,11 @@ export class TrapChatClient {
 
   #attemptReconnect() {
     if (!this.#lastRoom) return; // Only reconnect if user was in a room
+    if (this.#reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this.#emit('reconnect_failed', { attempts: this.#reconnectAttempts });
+      this.#reconnecting = false;
+      return;
+    }
     this.#reconnecting = true;
     const base = Math.min(
       BASE_RECONNECT_DELAY * Math.pow(2, this.#reconnectAttempts),
