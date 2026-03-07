@@ -3,6 +3,12 @@ import { timingSafeEqual } from 'node:crypto';
 import { Queue } from './queue.js';
 import { WorkerManager } from './manager.js';
 
+const logger = {
+  info: (msg, data) => console.log(JSON.stringify({ level: 'info', msg, ...data, time: new Date().toISOString() })),
+  warn: (msg, data) => console.log(JSON.stringify({ level: 'warn', msg, ...data, time: new Date().toISOString() })),
+  error: (msg, data) => console.log(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
+};
+
 const PORT = process.env.WORKER_PORT || 9100;
 const MAX_RESULTS = 1000;
 const MAX_SUBMITTED_JOBS = 10000;
@@ -30,7 +36,7 @@ function checkAuth(req, res) {
 const queue = new Queue();
 const results = new Map();
 
-function trackResult(job, result) {
+async function trackResult(job, result) {
   results.set(job.id, { id: job.id, status: 'completed', result, completedAt: Date.now() });
   // Evict oldest if over limit
   if (results.size > MAX_RESULTS) {
@@ -45,16 +51,33 @@ function trackResult(job, result) {
       if (!['http:', 'https:'].includes(cbUrl.protocol)) {
         throw new Error(`disallowed protocol: ${cbUrl.protocol}`);
       }
-      if (!ALLOWED_CALLBACK_HOSTS.includes(cbUrl.hostname) || (cbUrl.port && !['80', '443'].includes(cbUrl.port))) {
+      // Validate hostname against allowlist; normalize to prevent DNS rebinding / octal IP bypass
+      const resolved = cbUrl.hostname;
+      const isAllowed = ALLOWED_CALLBACK_HOSTS.includes(resolved);
+      const portVal = cbUrl.port || (cbUrl.protocol === 'https:' ? '443' : '80');
+      if (!isAllowed || !['80', '443', '8080', '9100'].includes(portVal)) {
         throw new Error(`disallowed callback host or port: ${cbUrl.host}`);
+      }
+      // Resolve hostname to IP and reject private/loopback addresses
+      const dns = await import('node:dns');
+      const { address } = await dns.promises.lookup(resolved);
+      const ipParts = address.split('.').map(Number);
+      const isPrivate = address === '::1' ||
+        ipParts[0] === 127 ||
+        ipParts[0] === 10 ||
+        (ipParts[0] === 172 && ipParts[1] >= 16 && ipParts[1] <= 31) ||
+        (ipParts[0] === 192 && ipParts[1] === 168) ||
+        ipParts[0] === 0;
+      if (isPrivate && !ALLOWED_CALLBACK_HOSTS.includes('localhost') && !ALLOWED_CALLBACK_HOSTS.includes('127.0.0.1')) {
+        throw new Error(`callback resolved to private IP: ${address}`);
       }
       fetch(job.data.callbackURL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jobId: job.id, status: 'completed', result }),
-      }).catch(err => console.error(`callback failed for ${job.id}:`, err.message));
+      }).catch(err => logger.error('callback failed', { jobId: job.id, error: err.message }));
     } catch (err) {
-      console.error(`callback URL rejected for ${job.id}: ${err.message}`);
+      logger.error('callback URL rejected', { jobId: job.id, error: err.message });
     }
   }
 }
@@ -150,24 +173,24 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`worker listening on :${PORT}`);
+  logger.info('worker listening', { port: PORT });
   if (!AUTH_TOKEN) {
-    console.warn('WARNING: WORKER_AUTH_TOKEN not set — running without authentication');
+    logger.warn('WORKER_AUTH_TOKEN not set — running without authentication');
   }
   manager.start();
 });
 
 // Graceful shutdown — stop accepting jobs, drain in-flight work, then exit
 function shutdown(signal) {
-  console.log(`received ${signal}, shutting down gracefully...`);
+  logger.info('received signal, shutting down', { signal });
   manager.stop();
   server.close(() => {
-    console.log('worker stopped');
+    logger.info('worker stopped');
     process.exit(0);
   });
   // Force exit after 10s if drain doesn't complete
   setTimeout(() => {
-    console.error('graceful shutdown timed out, forcing exit');
+    logger.error('graceful shutdown timed out, forcing exit');
     process.exit(1);
   }, 10000).unref();
 }

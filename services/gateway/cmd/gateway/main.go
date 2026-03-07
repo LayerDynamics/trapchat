@@ -7,7 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -145,6 +145,13 @@ func (rl *rateLimiter) remove(peerID string) {
 	rl.mu.Unlock()
 }
 
+// relayInstance represents one relay backend connection.
+type relayInstance struct {
+	url  string
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
 // Server holds all gateway state, enabling testability and avoiding package-level globals.
 type Server struct {
 	store    *storage.Store
@@ -157,12 +164,19 @@ type Server struct {
 	relayConn *websocket.Conn
 	relayMu   sync.Mutex
 
+	// Multi-relay support: multiple relay instances for horizontal scaling.
+	// Messages are routed to relays via consistent hashing on room name.
+	relays    []*relayInstance
+	relaysMu  sync.RWMutex
+
 	rl        *rateLimiter
 	authToken string // optional — set via AUTH_TOKEN env var
 	serverKey []byte // AES-256-GCM key for server-side envelope signing
 
 	workerURL    string // optional — set via WORKER_URL env var
 	workerClient *http.Client
+
+	startTime time.Time // set in NewServer for uptime tracking
 }
 
 // allowedOrigins returns the set of permitted WebSocket origins from the
@@ -188,7 +202,8 @@ func NewServer() *Server {
 
 	serverKey, err := tccrypto.GenerateKey()
 	if err != nil {
-		log.Fatalf("failed to generate server key: %v", err)
+		slog.Error("failed to generate server key", "error", err)
+		os.Exit(1)
 	}
 
 	return &Server{
@@ -217,10 +232,14 @@ func NewServer() *Server {
 		serverKey: serverKey,
 		workerURL:    os.Getenv("WORKER_URL"),
 		workerClient: &http.Client{Timeout: 10 * time.Second},
+		startTime:    time.Now(),
 	}
 }
 
 func main() {
+	// Structured JSON logging
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	port := os.Getenv("GATEWAY_PORT")
 	if port == "" {
 		port = "8080"
@@ -228,10 +247,31 @@ func main() {
 
 	srv := NewServer()
 
-	relayURL := os.Getenv("RELAY_URL")
-	if relayURL != "" {
-		srv.relayURL = relayURL
-		go srv.connectRelay()
+	// Support multiple relay instances via RELAY_URLS (comma-separated) or single RELAY_URL
+	relayURLs := os.Getenv("RELAY_URLS")
+	if relayURLs == "" {
+		// Fall back to single RELAY_URL for backwards compatibility
+		if single := os.Getenv("RELAY_URL"); single != "" {
+			relayURLs = single
+		}
+	}
+	if relayURLs != "" {
+		for _, u := range strings.Split(relayURLs, ",") {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			ri := &relayInstance{url: u}
+			srv.relays = append(srv.relays, ri)
+		}
+		// Keep single relay fields for backward compat
+		if len(srv.relays) > 0 {
+			srv.relayURL = srv.relays[0].url
+		}
+		for _, ri := range srv.relays {
+			go srv.connectRelayInstance(ri)
+		}
+		slog.Info("relay instances configured", "count", len(srv.relays))
 	}
 
 	if srv.workerURL != "" {
@@ -240,6 +280,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
+	mux.HandleFunc("/health/all", srv.handleHealthAll)
+	mux.HandleFunc("/metrics", srv.handleMetrics)
 	mux.HandleFunc("/ws", srv.handleWebSocket)
 	mux.HandleFunc("/api/rooms", srv.handleRooms)
 	mux.HandleFunc("/api/rooms/", srv.handleRoomSub)
@@ -263,43 +305,56 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
-		log.Printf("received %s, shutting down gracefully...", sig)
+		slog.Info("received signal, shutting down", "signal", sig)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		if err := httpSrv.Shutdown(ctx); err != nil {
-			log.Printf("graceful shutdown error: %v", err)
+			slog.Error("graceful shutdown error", "error", err)
 		}
 	}()
 
-	log.Printf("gateway listening on %s", addr)
+	slog.Info("gateway listening", "addr", addr)
 	if srv.workerURL != "" {
-		log.Printf("worker integration enabled: %s", srv.workerURL)
+		slog.Info("worker integration enabled", "url", srv.workerURL)
 	}
 	var err error
 	if tlsCert != "" && tlsKey != "" {
-		log.Printf("TLS enabled")
+		slog.Info("TLS enabled")
 		err = httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
 	} else {
 		err = httpSrv.ListenAndServe()
 	}
 	if err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		slog.Error("server error", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("gateway stopped")
+	slog.Info("gateway stopped")
 }
 
-// connectRelay dials the relay and reads messages in a loop with reconnect backoff.
+// connectRelay connects the legacy single relay using connectRelayInstance.
+// Kept for backward compatibility when RELAY_URL is used without RELAY_URLS.
 func (s *Server) connectRelay() {
+	ri := &relayInstance{url: s.relayURL}
+	s.relaysMu.Lock()
+	if len(s.relays) == 0 {
+		s.relays = append(s.relays, ri)
+	}
+	s.relaysMu.Unlock()
+	s.connectRelayInstance(ri)
+}
+
+// connectRelayInstance dials a single relay instance and reads messages with reconnect backoff.
+func (s *Server) connectRelayInstance(ri *relayInstance) {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 
 	for {
-		log.Printf("connecting to relay at %s", s.relayURL)
-		conn, _, err := websocket.DefaultDialer.Dial(s.relayURL, nil)
+		slog.Info("connecting to relay instance", "url", ri.url)
+		conn, _, err := websocket.DefaultDialer.Dial(ri.url, nil)
 		if err != nil {
-			log.Printf("relay dial error: %v (retry in %v)", err, backoff)
+			slog.Warn("relay instance dial error", "url", ri.url, "error", err, "retry_in", backoff)
 			time.Sleep(backoff)
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -308,49 +363,90 @@ func (s *Server) connectRelay() {
 			continue
 		}
 
-		log.Printf("connected to relay at %s", s.relayURL)
+		slog.Info("connected to relay instance", "url", ri.url)
 		backoff = time.Second
 
-		s.relayMu.Lock()
-		s.relayConn = conn
-		s.relayMu.Unlock()
+		ri.mu.Lock()
+		ri.conn = conn
+		ri.mu.Unlock()
 
-		// Read loop: relay forwards messages from other gateways
+		// Also update legacy single-relay conn for the first instance
+		if len(s.relays) > 0 && s.relays[0] == ri {
+			s.relayMu.Lock()
+			s.relayConn = conn
+			s.relayMu.Unlock()
+		}
+
+		// Read loop
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("relay read error: %v", err)
+				slog.Error("relay instance read error", "url", ri.url, "error", err)
 				break
 			}
-
 			var env protocol.Envelope
 			if err := json.Unmarshal(msg, &env); err != nil {
-				log.Printf("invalid relay envelope: %v", err)
+				slog.Warn("invalid relay envelope", "error", err)
 				continue
 			}
-
-			// Broadcast to local peers, excluding the original sender (env.ID)
 			s.broadcast(env.Room, env, env.ID)
 		}
 
-		s.relayMu.Lock()
-		s.relayConn = nil
-		s.relayMu.Unlock()
+		ri.mu.Lock()
+		ri.conn = nil
+		ri.mu.Unlock()
+
+		if len(s.relays) > 0 && s.relays[0] == ri {
+			s.relayMu.Lock()
+			s.relayConn = nil
+			s.relayMu.Unlock()
+		}
 		conn.Close()
 
-		log.Printf("relay disconnected, reconnecting in %v", backoff)
+		slog.Warn("relay instance disconnected, reconnecting", "url", ri.url, "delay", backoff)
 		time.Sleep(backoff)
 	}
 }
 
-// forwardToRelay sends an envelope to the relay. No-op if not connected.
+// relayForRoom selects a relay instance for a room using consistent hashing.
+// This ensures all messages for a given room go to the same relay for proper fan-out.
+func (s *Server) relayForRoom(room string) *relayInstance {
+	if len(s.relays) == 0 {
+		return nil
+	}
+	// FNV-1a hash for fast, well-distributed selection
+	var h uint32 = 2166136261
+	for i := 0; i < len(room); i++ {
+		h ^= uint32(room[i])
+		h *= 16777619
+	}
+	return s.relays[h%uint32(len(s.relays))]
+}
+
+// forwardToRelay sends an envelope to the appropriate relay instance based on room.
+// With multiple relays, uses consistent hashing for load balancing.
+// Falls back to legacy single-relay connection if no multi-relay is configured.
 func (s *Server) forwardToRelay(env protocol.Envelope) {
 	data, err := json.Marshal(env)
 	if err != nil {
-		log.Printf("relay marshal error: %v", err)
+		slog.Error("relay marshal error", "error", err)
 		return
 	}
 
+	// Multi-relay path: route by room hash
+	if ri := s.relayForRoom(env.Room); ri != nil {
+		ri.mu.Lock()
+		defer ri.mu.Unlock()
+		if ri.conn == nil {
+			return
+		}
+		if err := ri.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			slog.Error("relay instance write error", "url", ri.url, "error", err)
+		}
+		return
+	}
+
+	// Legacy single-relay fallback
 	s.relayMu.Lock()
 	defer s.relayMu.Unlock()
 
@@ -359,7 +455,7 @@ func (s *Server) forwardToRelay(env protocol.Envelope) {
 	}
 
 	if err := s.relayConn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("relay write error: %v", err)
+		slog.Error("relay write error", "error", err)
 	}
 }
 
@@ -402,9 +498,9 @@ func (s *Server) cleanupLoop() {
 			"gatewayURL": gatewayURL,
 		})
 		if err != nil {
-			log.Printf("failed to submit room:cleanup job: %v", err)
+			slog.Error("failed to submit room:cleanup job", "error", err)
 		} else {
-			log.Printf("submitted room:cleanup job")
+			slog.Info("submitted room:cleanup job")
 		}
 	}
 }
@@ -413,7 +509,136 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "gateway"}); err != nil {
-		log.Printf("health encode error: %v", err)
+		slog.Error("health encode error", "error", err)
+	}
+}
+
+func (s *Server) handleHealthAll(w http.ResponseWriter, r *http.Request) {
+	type serviceStatus struct {
+		Status  string `json:"status"`
+		Service string `json:"service"`
+	}
+
+	result := map[string]interface{}{
+		"gateway": serviceStatus{Status: "ok", Service: "gateway"},
+	}
+
+	// Check relay health
+	relayHealthURL := os.Getenv("RELAY_HEALTH_URL")
+	if relayHealthURL == "" {
+		relayHealthURL = "http://relay:9001/health"
+	}
+	if resp, err := s.workerClient.Get(relayHealthURL); err != nil {
+		result["relay"] = serviceStatus{Status: "unreachable", Service: "relay"}
+	} else {
+		var sr serviceStatus
+		json.NewDecoder(resp.Body).Decode(&sr)
+		resp.Body.Close()
+		if sr.Status == "" {
+			sr.Status = "ok"
+		}
+		sr.Service = "relay"
+		result["relay"] = sr
+	}
+
+	// Check worker health
+	if s.workerURL != "" {
+		if resp, err := s.workerClient.Get(s.workerURL + "/health"); err != nil {
+			result["worker"] = serviceStatus{Status: "unreachable", Service: "worker"}
+		} else {
+			var sr serviceStatus
+			json.NewDecoder(resp.Body).Decode(&sr)
+			resp.Body.Close()
+			if sr.Status == "" {
+				sr.Status = "ok"
+			}
+			sr.Service = "worker"
+			result["worker"] = sr
+		}
+	}
+
+	// Determine overall status
+	overall := "ok"
+	for _, v := range result {
+		if ss, ok := v.(serviceStatus); ok && ss.Status != "ok" {
+			overall = "degraded"
+			break
+		}
+	}
+	result["status"] = overall
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleMetrics returns JSON with server metrics for monitoring and alerting.
+// Requires auth if AUTH_TOKEN is configured.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAuth(w, r) {
+		return
+	}
+
+	// Active connections
+	s.connMu.RLock()
+	activeConnections := len(s.conns)
+	s.connMu.RUnlock()
+
+	// Active rooms (distinct room names with at least one peer)
+	rooms := s.store.Rooms()
+	activeRooms := len(rooms)
+
+	// Rooms with peer counts
+	roomSnapshots := s.store.RoomsWithCounts()
+	type roomEntry struct {
+		Name      string `json:"name"`
+		PeerCount int    `json:"peer_count"`
+	}
+	roomsWithCounts := make([]roomEntry, 0, len(roomSnapshots))
+	for _, snap := range roomSnapshots {
+		roomsWithCounts = append(roomsWithCounts, roomEntry{
+			Name:      snap.Name,
+			PeerCount: snap.Count,
+		})
+	}
+
+	// Relay connectivity: any relay instance has a live connection
+	s.relaysMu.RLock()
+	relayCount := len(s.relays)
+	relayConnected := false
+	for _, ri := range s.relays {
+		ri.mu.Lock()
+		if ri.conn != nil {
+			relayConnected = true
+		}
+		ri.mu.Unlock()
+		if relayConnected {
+			break
+		}
+	}
+	s.relaysMu.RUnlock()
+
+	// Rate limiter bucket count
+	s.rl.mu.Lock()
+	rateLimiterBuckets := len(s.rl.buckets)
+	s.rl.mu.Unlock()
+
+	// Worker configured
+	workerConfigured := s.workerURL != ""
+
+	payload := map[string]interface{}{
+		"uptime_seconds":           time.Since(s.startTime).Seconds(),
+		"active_connections":       activeConnections,
+		"active_rooms":             activeRooms,
+		"total_rooms_with_counts":  roomsWithCounts,
+		"relay_connected":          relayConnected,
+		"relay_count":              relayCount,
+		"rate_limiter_buckets":     rateLimiterBuckets,
+		"worker_url":               workerConfigured,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		slog.Error("metrics encode error", "error", err)
 	}
 }
 
@@ -456,7 +681,7 @@ func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if err := json.NewEncoder(w).Encode(map[string]interface{}{"rooms": result, "count": len(result)}); err != nil {
-		log.Printf("rooms encode error: %v", err)
+		slog.Error("rooms encode error", "error", err)
 	}
 }
 
@@ -524,6 +749,30 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			"disconnected": len(peerIDs),
 		})
 
+	case "broadcast":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Type    string `json:"type"`
+			Payload string `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		env := protocol.Envelope{
+			Type:      protocol.MessageType(body.Type),
+			Room:      roomName,
+			Payload:   body.Payload,
+			ID:        "__worker__",
+			Timestamp: time.Now().UnixMilli(),
+		}
+		s.broadcast(roomName, env, "")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "broadcast sent", "room": roomName})
+
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -535,12 +784,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("upgrade error: %v", err)
+		slog.Error("upgrade error", "error", err)
 		return
 	}
 
 	peerID := newPeerID()
-	log.Printf("new connection: %s", peerID)
+	slog.Info("new connection", "peer", peerID)
 
 	// Limit max incoming message size to 1 MB
 	conn.SetReadLimit(1 << 20)
@@ -581,7 +830,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		p.closeSend()
 		conn.Close()
-		log.Printf("disconnected: %s", peerID)
+		slog.Info("disconnected", "peer", peerID)
 	}()
 
 	// Send periodic pings via control write (bypasses send queue).
@@ -610,13 +859,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("read error (%s): %v", peerID, err)
+			slog.Error("read error", "peer", peerID, "error", err)
 			break
 		}
 
 		var env protocol.Envelope
 		if err := json.Unmarshal(msg, &env); err != nil {
-			log.Printf("invalid envelope from %s: %v", peerID, err)
+			slog.Warn("invalid envelope", "peer", peerID, "error", err)
 			s.sendError(p, "invalid message format")
 			continue
 		}
@@ -770,7 +1019,7 @@ func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID str
 
 	data, err := json.Marshal(env)
 	if err != nil {
-		log.Printf("marshal error: %v", err)
+		slog.Error("marshal error", "error", err)
 		return
 	}
 
@@ -786,7 +1035,7 @@ func (s *Server) broadcastPresence(room string) {
 		Count: count,
 	})
 	if err != nil {
-		log.Printf("presence marshal error: %v", err)
+		slog.Error("presence marshal error", "error", err)
 		return
 	}
 	env := protocol.Envelope{

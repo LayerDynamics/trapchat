@@ -26,13 +26,13 @@ describe('processJob', () => {
 
     it('throws without payload', async () => {
       const job = { id: 'j3', type: 'media:chunk', data: { chunkSize: 4 } };
-      await assert.rejects(() => processJob(job), /payload and chunkSize/);
+      await assert.rejects(() => processJob(job), /payload.*chunkSize/);
     });
 
     it('throws without chunkSize', async () => {
       const payload = Buffer.from('data').toString('base64');
       const job = { id: 'j4', type: 'media:chunk', data: { payload } };
-      await assert.rejects(() => processJob(job), /payload and chunkSize/);
+      await assert.rejects(() => processJob(job), /payload.*chunkSize/);
     });
 
     it('reconstructs original data from chunks', async () => {

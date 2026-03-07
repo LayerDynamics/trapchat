@@ -109,6 +109,7 @@ type RoomMap = Arc<RwLock<HashMap<String, Room>>>;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
@@ -421,27 +422,40 @@ async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[
             None => return,
         }
     };
+    // Log framed message metadata for diagnostics
+    if let Ok(decoded) = serde_json::from_slice::<Message>(data) {
+        if let Ok(frame) = frame_message(&decoded) {
+            info!("fan_out frame_type={} len={} room={}", frame.frame_type, frame.payload.len(), room_name);
+        }
+    }
     let msg = match String::from_utf8(data.to_vec()) {
         Ok(text) => tokio_tungstenite::tungstenite::Message::Text(text.into()),
         Err(e) => tokio_tungstenite::tungstenite::Message::Binary(e.into_bytes().into()),
     };
-    let slow_peers = {
+    let stale_peers = {
         let room = room_arc.read().await;
-        let mut slow = Vec::new();
+        let mut stale = Vec::new();
         for (id, tx) in room.iter() {
             if id != sender_id {
-                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
-                    warn!("slow consumer {}, disconnecting", id);
-                    slow.push(id.clone());
+                match tx.try_send(msg.clone()) {
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("slow consumer {}, disconnecting", id);
+                        stale.push(id.clone());
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("closed consumer {}, removing", id);
+                        stale.push(id.clone());
+                    }
+                    Ok(_) => {}
                 }
             }
         }
-        slow
+        stale
     };
-    // Disconnect slow consumers by removing them from the room
-    if !slow_peers.is_empty() {
+    // Remove stale/slow consumers from the room
+    if !stale_peers.is_empty() {
         let mut room = room_arc.write().await;
-        for id in &slow_peers {
+        for id in &stale_peers {
             room.remove(id);
         }
     }
@@ -467,13 +481,10 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
         room_name.to_string(),
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
-    let msg = match frame_message(&presence) {
-        Ok(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes),
-        Err(e) => {
-            warn!("failed to frame presence message: {}", e);
-            return;
-        }
-    };
+    info!("broadcasting presence: room={} count={} payload={:?}", room_name, count, presence.payload);
+    let msg = tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "presence", "room": room_name, "count": count}).to_string().into(),
+    );
     for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
             warn!("slow consumer {} during presence broadcast, dropping", id);
