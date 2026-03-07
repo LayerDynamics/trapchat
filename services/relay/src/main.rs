@@ -468,7 +468,7 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
     let msg = match frame_message(&presence) {
-        Ok(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes),
+        Ok(frame) => tokio_tungstenite::tungstenite::Message::Binary(frame.encode()),
         Err(e) => {
             warn!("failed to frame presence message: {}", e);
             return;
