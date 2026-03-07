@@ -84,6 +84,9 @@ jobs:
             echo "No ESLint config found, skipping lint"
           fi
         working-directory: apps/trapchat
+      - name: Test frontend
+        run: npm test -- --run
+        working-directory: apps/trapchat
       - name: Build frontend
         run: npm run build
         working-directory: apps/trapchat
@@ -93,6 +96,24 @@ jobs:
     needs: [test-go, test-rust, test-node]
     steps:
       - uses: actions/checkout@v4
+      # Rust dependency audit
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Audit Rust dependencies
+        run: cargo audit
+      # Go vulnerability check
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: services/gateway/go.sum
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Audit Go dependencies
+        run: govulncheck ./...
+        working-directory: services/gateway
+      # Node dependency audits
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -102,7 +123,7 @@ jobs:
         run: npm ci
         working-directory: services/worker
       - name: Audit worker dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=moderate
         working-directory: services/worker
       - uses: actions/setup-node@v4
         with:
@@ -113,7 +134,7 @@ jobs:
         run: npm ci
         working-directory: apps/trapchat
       - name: Audit frontend dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=moderate
         working-directory: apps/trapchat
 
   build-docker:
@@ -131,13 +152,13 @@ jobs:
       - run: docker compose up -d
       - run: sleep 15
       - name: Check gateway health
-        run: curl -f http://localhost:8080/health
+        run: docker compose exec -T gateway wget -qO- http://localhost:8080/health
       - name: Check relay health
-        run: curl -f http://localhost:9001/health
+        run: docker compose exec -T relay wget -qO- http://localhost:9001/health
       - name: Check worker health
-        run: curl -f http://localhost:9100/health
+        run: docker compose exec -T worker wget -qO- http://localhost:9100/health
       - name: Check aggregated health
-        run: curl -f http://localhost:8080/health/all
+        run: docker compose exec -T gateway wget -qO- http://localhost:8080/health/all
       - run: docker compose down
 
 # deploy:

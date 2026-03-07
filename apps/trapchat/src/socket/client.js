@@ -71,14 +71,14 @@ export class TrapChatClient {
    * Send a message. Returns true if sent immediately, false if queued or dropped.
    * Chat/media messages are queued when disconnected (up to 200) and flushed on reconnect.
    */
-  send(type, room, payload) {
+  send(type, room, payload, { msgId } = {}) {
     if (type === 'join') {
       this.#lastRoom = room;
     } else if (type === 'leave') {
       this.#lastRoom = null;
     }
 
-    const msg = JSON.stringify({ id: crypto.randomUUID(), type, room, payload, timestamp: Date.now() });
+    const msg = JSON.stringify({ id: crypto.randomUUID(), msgId: msgId || crypto.randomUUID(), type, room, payload, timestamp: Date.now() });
 
     if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
       // Queue chat/media messages for delivery after reconnect

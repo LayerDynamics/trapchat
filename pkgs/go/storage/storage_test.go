@@ -171,6 +171,47 @@ func TestRoomsWithCountsAtomicSnapshot(t *testing.T) {
 	}
 }
 
+func TestSetNickname(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	s.SetNickname("room1", "peer1", "alice")
+	nicks := s.PeersWithNicknames("room1")
+	if nicks["peer1"] != "alice" {
+		t.Fatalf("expected nickname 'alice', got %q", nicks["peer1"])
+	}
+}
+
+func TestPeersWithNicknames(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	s.Join("room1", "peer2")
+	s.SetNickname("room1", "peer1", "alice")
+	nicks := s.PeersWithNicknames("room1")
+	if len(nicks) != 2 {
+		t.Fatalf("expected 2 peers, got %d", len(nicks))
+	}
+	if nicks["peer1"] != "alice" {
+		t.Fatalf("expected 'alice', got %q", nicks["peer1"])
+	}
+	if nicks["peer2"] != "" {
+		t.Fatalf("expected empty nickname, got %q", nicks["peer2"])
+	}
+}
+
+func TestPeersWithNicknamesNonexistent(t *testing.T) {
+	s := NewStore()
+	nicks := s.PeersWithNicknames("nope")
+	if nicks != nil {
+		t.Fatalf("expected nil, got %v", nicks)
+	}
+}
+
+func TestSetNicknameNonexistentRoom(t *testing.T) {
+	s := NewStore()
+	// Should not panic
+	s.SetNickname("nope", "peer1", "alice")
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	s := NewStore()
 	var wg sync.WaitGroup

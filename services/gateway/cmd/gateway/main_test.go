@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"trapchat/pkgs/protocol"
@@ -185,6 +186,60 @@ func TestSignEnvelopeProducesSignature(t *testing.T) {
 	srv.signEnvelope(env)
 	if env.Sig == "" {
 		t.Error("signEnvelope should produce a non-empty signature")
+	}
+}
+
+func TestValidateRoomName(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		wantOK bool
+	}{
+		{"valid simple", "my-room", true},
+		{"valid unicode", "café-日本語", true},
+		{"valid with dots", "room.name.123", true},
+		{"empty", "", false},
+		{"too long", strings.Repeat("a", 65), false},
+		{"max length", strings.Repeat("a", 64), true},
+		{"has space", "my room", true},
+		{"has newline", "room\nname", false},
+		{"has tab", "room\tname", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := validateRoomName(tt.input)
+			if tt.wantOK && result != "" {
+				t.Errorf("expected valid, got error: %s", result)
+			}
+			if !tt.wantOK && result == "" {
+				t.Error("expected error, got valid")
+			}
+		})
+	}
+}
+
+func TestSanitizeNickname(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"normal", "Alice", "Alice"},
+		{"empty", "", ""},
+		{"control chars stripped", "Al\x00ic\x1Fe", "Alice"},
+		{"DEL stripped", "Bob\x7F", "Bob"},
+		{"truncated at 32", "abcdefghijklmnopqrstuvwxyz1234567890", "abcdefghijklmnopqrstuvwxyz123456"},
+		{"whitespace trimmed", "  Alice  ", "Alice"},
+		{"only control chars", "\x00\x01\x02", ""},
+		{"unicode preserved", "名前テスト", "名前テスト"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeNickname(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeNickname(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -82,7 +82,7 @@ func TestDecryptTooShort(t *testing.T) {
 }
 
 func TestSignHMACDeterministic(t *testing.T) {
-	key := []byte("test-key-32-bytes-long-enough!!")
+	key := []byte("test-key-exactly-32-bytes-long!!")
 	sig1 := SignHMAC(key, "a", "b", "c")
 	sig2 := SignHMAC(key, "a", "b", "c")
 	if !bytes.Equal(sig1, sig2) {
@@ -91,7 +91,7 @@ func TestSignHMACDeterministic(t *testing.T) {
 }
 
 func TestSignHMACDifferentInputs(t *testing.T) {
-	key := []byte("test-key-32-bytes-long-enough!!")
+	key := []byte("test-key-exactly-32-bytes-long!!")
 	sig1 := SignHMAC(key, "a", "b")
 	sig2 := SignHMAC(key, "ab", "")
 	if bytes.Equal(sig1, sig2) {
@@ -100,7 +100,7 @@ func TestSignHMACDifferentInputs(t *testing.T) {
 }
 
 func TestSignHMACDelimiterInjection(t *testing.T) {
-	key := []byte("test-key-32-bytes-long-enough!!")
+	key := []byte("test-key-exactly-32-bytes-long!!")
 	// These would collide with pipe-delimited "a|b" vs "a" + "b"
 	sig1 := SignHMAC(key, "a|b", "c")
 	sig2 := SignHMAC(key, "a", "b|c")
@@ -110,7 +110,7 @@ func TestSignHMACDelimiterInjection(t *testing.T) {
 }
 
 func TestVerifyHMAC(t *testing.T) {
-	key := []byte("test-key-32-bytes-long-enough!!")
+	key := []byte("test-key-exactly-32-bytes-long!!")
 	sig := SignHMAC(key, "field1", "field2")
 	if !VerifyHMAC(key, sig, "field1", "field2") {
 		t.Error("valid signature should verify")

@@ -1,6 +1,6 @@
 use crate::IoError;
 
-const MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 MB
+pub const MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 MB
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
@@ -14,13 +14,22 @@ impl Frame {
     }
 
     /// Encode frame: [type:1][length:4 BE][payload:N]
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Returns an error if the payload exceeds MAX_FRAME_SIZE, preventing
+    /// silent truncation of the u32 length field for payloads > 4GB.
+    pub fn encode(&self) -> Result<Vec<u8>, IoError> {
+        if self.payload.len() > MAX_FRAME_SIZE {
+            return Err(IoError::FrameTooLarge {
+                size: self.payload.len(),
+                max: MAX_FRAME_SIZE,
+            });
+        }
         let len = self.payload.len() as u32;
         let mut buf = Vec::with_capacity(5 + self.payload.len());
         buf.push(self.frame_type);
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&self.payload);
-        buf
+        Ok(buf)
     }
 
     /// Decode frame from bytes. Returns (Frame, bytes_consumed).
@@ -62,9 +71,15 @@ mod tests {
     #[test]
     fn roundtrip() {
         let frame = Frame::new(1, b"hello".to_vec());
-        let encoded = frame.encode();
+        let encoded = frame.encode().unwrap();
         let (decoded, consumed) = Frame::decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
         assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_payload() {
+        let frame = Frame::new(1, vec![0u8; MAX_FRAME_SIZE + 1]);
+        assert!(frame.encode().is_err());
     }
 }

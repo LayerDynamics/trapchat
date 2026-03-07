@@ -28,6 +28,7 @@ import (
 const (
 	peerSendBufSize  = 64
 	writeWaitTimeout = 10 * time.Second
+	maxRooms         = 10000 // Maximum concurrent rooms to prevent DoS via unbounded room creation
 )
 
 // peer wraps a websocket connection with a buffered write queue.
@@ -102,11 +103,35 @@ type tokenBucket struct {
 }
 
 func newRateLimiter(rate int, interval time.Duration, burst int) *rateLimiter {
-	return &rateLimiter{
+	rl := &rateLimiter{
 		buckets:  make(map[string]*tokenBucket),
 		rate:     rate,
 		interval: interval,
 		burst:    burst,
+	}
+	go rl.pruneLoop()
+	return rl
+}
+
+// pruneLoop periodically removes stale buckets that haven't been used
+// for longer than the refill interval * burst (i.e., fully replenished and idle).
+// This prevents unbounded growth from abnormal disconnects or missed cleanup.
+func (rl *rateLimiter) pruneLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		staleThreshold := rl.interval * time.Duration(rl.burst)
+		if staleThreshold < time.Minute {
+			staleThreshold = time.Minute
+		}
+		for id, b := range rl.buckets {
+			if now.Sub(b.lastFill) > staleThreshold {
+				delete(rl.buckets, id)
+			}
+		}
+		rl.mu.Unlock()
 	}
 }
 
@@ -121,15 +146,17 @@ func (rl *rateLimiter) allow(peerID string) bool {
 		rl.buckets[peerID] = b
 	}
 
-	// Refill tokens based on elapsed time
+	// Refill tokens based on elapsed time, preserving sub-interval remainder
 	elapsed := time.Since(b.lastFill)
-	refill := int(elapsed / rl.interval) * rl.rate
+	intervals := int(elapsed / rl.interval)
+	refill := intervals * rl.rate
 	if refill > 0 {
 		b.tokens += refill
 		if b.tokens > rl.burst {
 			b.tokens = rl.burst
 		}
-		b.lastFill = time.Now()
+		// Advance lastFill by exact intervals consumed, preserving fractional remainder
+		b.lastFill = b.lastFill.Add(time.Duration(intervals) * rl.interval)
 	}
 
 	if b.tokens <= 0 {
@@ -170,6 +197,7 @@ type Server struct {
 	relaysMu  sync.RWMutex
 
 	rl        *rateLimiter
+	typingRL  *rateLimiter // separate rate limiter for typing indicators
 	authToken string // optional — set via AUTH_TOKEN env var
 	serverKey []byte // AES-256-GCM key for server-side envelope signing
 
@@ -228,6 +256,7 @@ func NewServer() *Server {
 		peerRooms: make(map[string]string),
 		// 10 messages per second, burst of 20
 		rl:        newRateLimiter(10, time.Second, 20),
+		typingRL:  newRateLimiter(1, 2*time.Second, 3),
 		authToken: os.Getenv("AUTH_TOKEN"),
 		serverKey: serverKey,
 		workerURL:    os.Getenv("WORKER_URL"),
@@ -333,18 +362,6 @@ func main() {
 	slog.Info("gateway stopped")
 }
 
-// connectRelay connects the legacy single relay using connectRelayInstance.
-// Kept for backward compatibility when RELAY_URL is used without RELAY_URLS.
-func (s *Server) connectRelay() {
-	ri := &relayInstance{url: s.relayURL}
-	s.relaysMu.Lock()
-	if len(s.relays) == 0 {
-		s.relays = append(s.relays, ri)
-	}
-	s.relaysMu.Unlock()
-	s.connectRelayInstance(ri)
-}
-
 // connectRelayInstance dials a single relay instance and reads messages with reconnect backoff.
 func (s *Server) connectRelayInstance(ri *relayInstance) {
 	backoff := time.Second
@@ -411,6 +428,8 @@ func (s *Server) connectRelayInstance(ri *relayInstance) {
 // relayForRoom selects a relay instance for a room using consistent hashing.
 // This ensures all messages for a given room go to the same relay for proper fan-out.
 func (s *Server) relayForRoom(room string) *relayInstance {
+	s.relaysMu.RLock()
+	defer s.relaysMu.RUnlock()
 	if len(s.relays) == 0 {
 		return nil
 	}
@@ -440,6 +459,7 @@ func (s *Server) forwardToRelay(env protocol.Envelope) {
 		if ri.conn == nil {
 			return
 		}
+		ri.conn.SetWriteDeadline(time.Now().Add(writeWaitTimeout))
 		if err := ri.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			slog.Error("relay instance write error", "url", ri.url, "error", err)
 		}
@@ -454,6 +474,7 @@ func (s *Server) forwardToRelay(env protocol.Envelope) {
 		return
 	}
 
+	s.relayConn.SetWriteDeadline(time.Now().Add(writeWaitTimeout))
 	if err := s.relayConn.WriteMessage(websocket.TextMessage, data); err != nil {
 		slog.Error("relay write error", "error", err)
 	}
@@ -583,22 +604,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	activeConnections := len(s.conns)
 	s.connMu.RUnlock()
 
-	// Active rooms (distinct room names with at least one peer)
-	rooms := s.store.Rooms()
-	activeRooms := len(rooms)
-
-	// Rooms with peer counts
+	// Rooms with peer counts (single lock acquisition)
 	roomSnapshots := s.store.RoomsWithCounts()
-	type roomEntry struct {
-		Name      string `json:"name"`
-		PeerCount int    `json:"peer_count"`
-	}
-	roomsWithCounts := make([]roomEntry, 0, len(roomSnapshots))
+	activeRooms := len(roomSnapshots)
+	// Expose only peer counts per room (without room names) for privacy
+	roomPeerCounts := make([]int, 0, len(roomSnapshots))
 	for _, snap := range roomSnapshots {
-		roomsWithCounts = append(roomsWithCounts, roomEntry{
-			Name:      snap.Name,
-			PeerCount: snap.Count,
-		})
+		roomPeerCounts = append(roomPeerCounts, snap.Count)
 	}
 
 	// Relay connectivity: any relay instance has a live connection
@@ -629,7 +641,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds":           time.Since(s.startTime).Seconds(),
 		"active_connections":       activeConnections,
 		"active_rooms":             activeRooms,
-		"total_rooms_with_counts":  roomsWithCounts,
+		"room_peer_counts":         roomPeerCounts,
 		"relay_connected":          relayConnected,
 		"relay_count":              relayCount,
 		"rate_limiter_buckets":     rateLimiterBuckets,
@@ -758,13 +770,23 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			Type    string `json:"type"`
 			Payload string `json:"payload"`
 		}
-        r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
-        if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB limit
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
+		// Only allow safe broadcast types to prevent injection of chat/media messages
+		allowedBroadcastTypes := map[protocol.MessageType]bool{
+			protocol.TypeError:    true,
+			protocol.TypePresence: true,
+		}
+		msgType := protocol.MessageType(body.Type)
+		if !allowedBroadcastTypes[msgType] {
+			http.Error(w, fmt.Sprintf("broadcast type %q not allowed", body.Type), http.StatusBadRequest)
+			return
+		}
 		env := protocol.Envelope{
-			Type:      protocol.MessageType(body.Type),
+			Type:      msgType,
 			Room:      roomName,
 			Payload:   body.Payload,
 			ID:        "__worker__",
@@ -813,6 +835,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		pingTicker.Stop()
 		s.rl.remove(peerID)
+		s.typingRL.remove(peerID)
 		s.connMu.Lock()
 		room := s.peerRooms[peerID]
 		delete(s.conns, peerID)
@@ -872,7 +895,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Validate room name for types that require one
-		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia {
+		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia || env.Type == protocol.TypeTyping || env.Type == protocol.TypeReceipt || env.Type == protocol.TypeKeyRotation {
 			if reason := validateRoomName(env.Room); reason != "" {
 				s.sendError(p, reason)
 				continue
@@ -881,6 +904,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch env.Type {
 		case protocol.TypeJoin:
+			// Enforce room creation limit to prevent DoS
+			if s.store.Count(env.Room) == 0 && s.store.RoomCount() >= maxRooms {
+				s.sendError(p, "room limit reached — try again later")
+				continue
+			}
+
 			// Atomically read previous room and update mapping
 			s.connMu.Lock()
 			prevRoom := s.peerRooms[peerID]
@@ -893,6 +922,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 			s.store.Join(env.Room, peerID)
+
+			// Parse optional nickname from join payload
+			if env.Payload != "" {
+				var jp protocol.JoinPayload
+				if err := json.Unmarshal([]byte(env.Payload), &jp); err == nil {
+					nick := sanitizeNickname(jp.Nickname)
+					if nick != "" {
+						s.store.SetNickname(env.Room, peerID, nick)
+					}
+				}
+			}
+
 			s.broadcastPresence(env.Room)
 			s.forwardToRelay(protocol.Envelope{
 				Type:      protocol.TypeJoin,
@@ -928,6 +969,54 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			// Override client-supplied room with the server-authoritative room
 			// to prevent broadcasting to a room the peer hasn't joined.
+			env.Room = inRoom
+			env.ID = peerID
+			env.Timestamp = time.Now().UnixMilli()
+			s.broadcast(inRoom, env, peerID)
+			s.forwardToRelay(env)
+
+		case protocol.TypeTyping:
+			s.connMu.RLock()
+			inRoom := s.peerRooms[peerID]
+			s.connMu.RUnlock()
+			if inRoom == "" {
+				s.sendError(p, "must join a room before sending typing")
+				continue
+			}
+			if !s.typingRL.allow(peerID) {
+				continue // silently drop excess typing indicators
+			}
+			env.Room = inRoom
+			env.ID = peerID
+			env.Timestamp = time.Now().UnixMilli()
+			// Typing indicators are NOT forwarded to relay — local gateway only
+			s.broadcast(inRoom, env, peerID)
+
+		case protocol.TypeReceipt:
+			s.connMu.RLock()
+			inRoom := s.peerRooms[peerID]
+			s.connMu.RUnlock()
+			if inRoom == "" {
+				s.sendError(p, "must join a room before sending receipts")
+				continue
+			}
+			env.Room = inRoom
+			env.ID = peerID
+			env.Timestamp = time.Now().UnixMilli()
+			s.broadcast(inRoom, env, peerID)
+
+		case protocol.TypeKeyRotation:
+			if !s.rl.allow(peerID) {
+				s.sendError(p, "rate limit exceeded — slow down")
+				continue
+			}
+			s.connMu.RLock()
+			inRoom := s.peerRooms[peerID]
+			s.connMu.RUnlock()
+			if inRoom == "" {
+				s.sendError(p, "must join a room before sending key rotation")
+				continue
+			}
 			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
@@ -970,6 +1059,24 @@ func validateRoomName(name string) string {
 		return "room name contains invalid characters"
 	}
 	return ""
+}
+
+// sanitizeNickname cleans a nickname: strips control chars, limits to 32 runes.
+func sanitizeNickname(nick string) string {
+	var b strings.Builder
+	count := 0
+	for _, r := range nick {
+		if count >= 32 {
+			break
+		}
+		// Strip control characters
+		if r < 32 || r == 127 {
+			continue
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (s *Server) sendError(p *peer, msg string) {
@@ -1030,10 +1137,12 @@ func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID str
 }
 
 func (s *Server) broadcastPresence(room string) {
-	count := s.store.Count(room)
+	peers := s.store.PeersWithNicknames(room)
+	count := len(peers)
 	payload, err := json.Marshal(protocol.PresencePayload{
 		Room:  room,
 		Count: count,
+		Peers: peers,
 	})
 	if err != nil {
 		slog.Error("presence marshal error", "error", err)

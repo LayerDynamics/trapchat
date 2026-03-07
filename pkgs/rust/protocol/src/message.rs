@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageType {
     Join,
     Leave,
@@ -10,6 +11,9 @@ pub enum MessageType {
     Media,
     Presence,
     Error,
+    Typing,
+    Receipt,
+    KeyRotation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +74,7 @@ mod tests {
 
     #[test]
     fn all_message_types_deserialize() {
-        for t in ["join", "leave", "chat", "media", "presence", "error"] {
+        for t in ["join", "leave", "chat", "media", "presence", "error", "typing", "receipt", "key_rotation"] {
             let json = format!(r#"{{"type":"{}","room":"r","timestamp":0}}"#, t);
             let msg: Message = serde_json::from_str(&json).unwrap();
             assert_eq!(msg.room, "r");

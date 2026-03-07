@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, RwLock, Mutex};
 use tokio_tungstenite::accept_hdr_async;
 use tracing::{info, warn, error};
 use trapchat_io::Frame;
-use trapchat_protocol::{Message, MessageType, RoomEvent};
+use trapchat_protocol::{Message, MessageType, ProtocolError, RoomEvent};
 
 /// Frame type constants for the binary framing protocol.
 const FRAME_TYPE_MESSAGE: u8 = 1;
@@ -59,6 +59,8 @@ const MAX_ROOMS: usize = 10_000;
 const MAX_CONNECTIONS: usize = 10_000;
 /// Max new connections per IP per second.
 const MAX_CONN_PER_IP_PER_SEC: usize = 10;
+/// Maximum number of tracked IPs in the rate limiter to prevent unbounded memory growth.
+const MAX_RATE_LIMITER_IPS: usize = 100_000;
 /// Maximum room name length in Unicode scalar values.
 const MAX_ROOM_NAME_LEN: usize = 64;
 
@@ -90,6 +92,13 @@ impl IpRateLimiter {
     fn allow(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(1);
+
+        // Cap total tracked IPs to prevent unbounded memory growth from distributed attacks
+        if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_RATE_LIMITER_IPS {
+            warn!("IP rate limiter at capacity ({} IPs), rejecting new IP {}", self.buckets.len(), ip);
+            return false;
+        }
+
         let timestamps = self.buckets.entry(ip).or_default();
         timestamps.retain(|t| now.duration_since(*t) < window);
         if timestamps.len() >= MAX_CONN_PER_IP_PER_SEC {
@@ -129,12 +138,12 @@ async fn main() {
     let conn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ip_limiter = Arc::new(Mutex::new(IpRateLimiter::new()));
 
-    let allowed_origins: Vec<String> = std::env::var("RELAY_ALLOWED_ORIGINS")
+    let allowed_origins: Arc<Vec<String>> = Arc::new(std::env::var("RELAY_ALLOWED_ORIGINS")
         .unwrap_or_else(|_| String::new())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect();
+        .collect());
 
     // Periodically prune stale IP rate limiter entries
     {
@@ -168,9 +177,13 @@ async fn main() {
                 break;
             }
         };
-        let current = conn_count.load(std::sync::atomic::Ordering::Relaxed);
-        if current >= MAX_CONNECTIONS {
-            let relay_err = RelayError::ConnectionLimit { current, max: MAX_CONNECTIONS };
+        // Atomically reserve a connection slot first, then check the limit.
+        // This prevents the TOCTOU race where multiple tasks could pass a
+        // load-then-check and exceed MAX_CONNECTIONS.
+        let prev = conn_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if prev >= MAX_CONNECTIONS {
+            conn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            let relay_err = RelayError::ConnectionLimit { current: prev, max: MAX_CONNECTIONS };
             warn!("{}, rejecting {}", relay_err, peer);
             drop(stream);
             continue;
@@ -180,18 +193,17 @@ async fn main() {
         {
             let mut limiter = ip_limiter.lock().await;
             if !limiter.allow(peer.ip()) {
+                conn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 warn!("per-IP connection rate limit exceeded for {}, rejecting", peer.ip());
                 drop(stream);
                 continue;
             }
         }
 
-        conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         info!("new connection from {}", peer);
         let rooms = rooms.clone();
         let conn_count = conn_count.clone();
-        let allowed_origins = allowed_origins.clone();
+        let allowed_origins = Arc::clone(&allowed_origins);
         tokio::spawn(async move {
             handle_connection(stream, rooms, &allowed_origins).await;
             conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -254,15 +266,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                 }
                 let decoded: Message = match serde_json::from_slice(&data) {
                     Ok(m) => m,
-                    Err(_) => {
-                        warn!("invalid message from {}", peer_id);
+                    Err(e) => {
+                        let proto_err = ProtocolError::Serialization(e);
+                        warn!("from {}: {}", peer_id, proto_err);
                         continue;
                     }
                 };
 
                 // Validate room name for types that reference a room
                 match decoded.msg_type {
-                    MessageType::Join | MessageType::Leave | MessageType::Chat | MessageType::Media => {
+                    MessageType::Join | MessageType::Leave | MessageType::Chat | MessageType::Media | MessageType::Typing | MessageType::Receipt | MessageType::KeyRotation => {
                         if let Err(reason) = validate_room_name(&decoded.room) {
                             let relay_err = RelayError::RoomValidation(reason.to_string());
                             warn!("from {}: {}", peer_id, relay_err);
@@ -335,9 +348,9 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                         }
                         broadcast_presence(&rooms, &room_name).await;
                     }
-                    MessageType::Chat | MessageType::Media => {
+                    MessageType::Chat | MessageType::Media | MessageType::Typing | MessageType::Receipt | MessageType::KeyRotation => {
                         if let Some(ref room_name) = current_room {
-                            fan_out_msg(&rooms, room_name, &peer_id, &data).await;
+                            fan_out_msg(&rooms, room_name, &peer_id, &data, &decoded).await;
                         }
                     }
                     MessageType::Leave => {
@@ -348,6 +361,9 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                         }
                     }
                     MessageType::Presence | MessageType::Error => {}
+                    _ => {
+                        warn!("unhandled message type from {}: {:?}", peer_id, decoded.msg_type);
+                    }
                 }
             }
             Err(e) => {
@@ -386,9 +402,9 @@ async fn leave_room(rooms: &RoomMap, room_name: &str, peer_id: &str) {
         peer_count: count,
     };
     if let Ok(frame) = frame_event(&event) {
-                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
-                                serde_json::to_string(&event).unwrap_or_default());
-                        }
+        info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
+            serde_json::to_string(&event).unwrap_or_default());
+    }
 
     if count == 0 {
         // Quick check without the outer write lock to avoid blocking all rooms
@@ -409,16 +425,16 @@ async fn leave_room(rooms: &RoomMap, room_name: &str, peer_id: &str) {
                         room: room_name.to_string(),
                     };
                     if let Ok(frame) = frame_event(&event) {
-                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
-                                serde_json::to_string(&event).unwrap_or_default());
-                        }
+                        info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
+                            serde_json::to_string(&event).unwrap_or_default());
+                    }
                 }
             }
         }
     }
 }
 
-async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[u8]) {
+async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[u8], decoded: &Message) {
     let room_arc = {
         let map = rooms.read().await;
         match map.get(room_name) {
@@ -426,10 +442,11 @@ async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[
             None => return,
         }
     };
-    // Log framed message metadata for diagnostics
-    if let Ok(decoded) = serde_json::from_slice::<Message>(data) {
-        if let Ok(frame) = frame_message(&decoded) {
-            info!("fan_out frame_type={} len={} room={}", frame.frame_type, frame.payload.len(), room_name);
+    // Log message metadata; full frame serialization only at debug level to avoid hot-path overhead
+    info!("fan_out type={:?} len={} room={}", decoded.msg_type, data.len(), room_name);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        if let Ok(frame) = frame_message(decoded) {
+            tracing::debug!("fan_out frame_type={} payload_len={}", frame.frame_type, frame.payload.len());
         }
     }
     let msg = match String::from_utf8(data.to_vec()) {
@@ -486,9 +503,14 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
     info!("broadcasting presence: room={} count={} payload={:?}", room_name, count, presence.payload);
-    let msg = tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::to_string(&presence).expect("Failed to serialize presence message"),
-    );
+    let serialized = match serde_json::to_string(&presence) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to serialize presence message: {}", e);
+            return;
+        }
+    };
+    let msg = tokio_tungstenite::tungstenite::Message::Text(serialized);
     for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
             warn!("slow consumer {} during presence broadcast, dropping", id);

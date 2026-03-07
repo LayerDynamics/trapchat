@@ -8,7 +8,7 @@ import (
 // Room tracks connected peers for one chat room.
 type Room struct {
 	Name         string
-	Peers        map[string]bool
+	Peers        map[string]string // peerID → nickname (empty string if no nickname)
 	LastActivity time.Time
 }
 
@@ -30,10 +30,12 @@ func (s *Store) Join(room, peerID string) int {
 
 	r, ok := s.rooms[room]
 	if !ok {
-		r = &Room{Name: room, Peers: make(map[string]bool)}
+		r = &Room{Name: room, Peers: make(map[string]string)}
 		s.rooms[room] = r
 	}
-	r.Peers[peerID] = true
+	if _, exists := r.Peers[peerID]; !exists {
+		r.Peers[peerID] = ""
+	}
 	r.LastActivity = time.Now()
 	return len(r.Peers)
 }
@@ -84,6 +86,36 @@ func (s *Store) Peers(room string) []string {
 	return peers
 }
 
+// SetNickname sets a nickname for a peer in a room.
+func (s *Store) SetNickname(room, peerID, nickname string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, ok := s.rooms[room]
+	if !ok {
+		return
+	}
+	if _, exists := r.Peers[peerID]; exists {
+		r.Peers[peerID] = nickname
+	}
+}
+
+// PeersWithNicknames returns a map of peerID→nickname for a room.
+func (s *Store) PeersWithNicknames(room string) map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	r, ok := s.rooms[room]
+	if !ok {
+		return nil
+	}
+	result := make(map[string]string, len(r.Peers))
+	for id, nick := range r.Peers {
+		result[id] = nick
+	}
+	return result
+}
+
 // Rooms returns a list of active room names.
 func (s *Store) Rooms() []string {
 	s.mu.RLock()
@@ -127,6 +159,13 @@ func (s *Store) StaleRooms(maxIdle time.Duration) []string {
 		}
 	}
 	return stale
+}
+
+// RoomCount returns the total number of active rooms.
+func (s *Store) RoomCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.rooms)
 }
 
 // RoomInfo returns peer count, last activity, and existence for a room.
