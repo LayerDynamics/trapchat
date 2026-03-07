@@ -16,6 +16,7 @@ const FRAME_TYPE_EVENT: u8 = 2;
 
 /// Relay-specific error types.
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::result_large_err)]
 enum RelayError {
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
@@ -37,12 +38,14 @@ enum RelayError {
 }
 
 /// Encode a Message into a Frame for structured logging or binary transport.
+#[allow(clippy::result_large_err)]
 fn frame_message(msg: &Message) -> Result<Frame, RelayError> {
     let payload = serde_json::to_vec(msg)?;
     Ok(Frame::new(FRAME_TYPE_MESSAGE, payload))
 }
 
 /// Encode a RoomEvent into a Frame for structured logging or binary transport.
+#[allow(clippy::result_large_err)]
 fn frame_event(event: &RoomEvent) -> Result<Frame, RelayError> {
     let payload = serde_json::to_vec(event)?;
     Ok(Frame::new(FRAME_TYPE_EVENT, payload))
@@ -196,6 +199,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowed_origins: &[String]) {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
@@ -268,7 +272,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                                 Some(reason.to_string()),
                             );
                             if let Ok(data) = serde_json::to_string(&err) {
-                                let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data.into()));
+                                let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
                             }
                             continue;
                         }
@@ -296,7 +300,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                                     Some("room limit reached".to_string()),
                                 );
                                 if let Ok(data) = serde_json::to_string(&err) {
-                                    let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data.into()));
+                                    let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
                                 }
                                 continue;
                             }
@@ -429,8 +433,8 @@ async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[
         }
     }
     let msg = match String::from_utf8(data.to_vec()) {
-        Ok(text) => tokio_tungstenite::tungstenite::Message::Text(text.into()),
-        Err(e) => tokio_tungstenite::tungstenite::Message::Binary(e.into_bytes().into()),
+        Ok(text) => tokio_tungstenite::tungstenite::Message::Text(text),
+        Err(e) => tokio_tungstenite::tungstenite::Message::Binary(e.into_bytes()),
     };
     let stale_peers = {
         let room = room_arc.read().await;
@@ -483,7 +487,7 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
     );
     info!("broadcasting presence: room={} count={} payload={:?}", room_name, count, presence.payload);
     let msg = tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({"type": "presence", "room": room_name, "count": count}).to_string().into(),
+        serde_json::json!({"type": "presence", "room": room_name, "count": count}).to_string(),
     );
     for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
