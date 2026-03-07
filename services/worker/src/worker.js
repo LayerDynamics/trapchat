@@ -28,8 +28,8 @@ export async function processJob(job) {
         throw new Error('room:cleanup requires gatewayURL');
       }
       const parsedGw = new URL(gatewayURL);
-      if (!['http:', 'https:'].includes(parsedGw.protocol) || !ALLOWED_GATEWAY_HOSTS.includes(parsedGw.hostname)) {
-        throw new Error(`disallowed gatewayURL host: ${parsedGw.hostname}`);
+      if (!['http:', 'https:'].includes(parsedGw.protocol) || !ALLOWED_GATEWAY_HOSTS.includes(parsedGw.hostname) || (parsedGw.port && !['80', '443', '8080'].includes(parsedGw.port))) {
+        throw new Error(`disallowed gatewayURL host or port: ${parsedGw.host}`);
       }
 
       const FETCH_TIMEOUT = 15_000; // 15s timeout for all outbound requests
