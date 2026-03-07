@@ -6,9 +6,11 @@ export class WorkerManager {
   #queue;
   #running = false;
   #timer = null;
+  #onResult = null;
 
-  constructor(queue) {
+  constructor(queue, { onResult } = {}) {
     this.#queue = queue;
+    this.#onResult = onResult || null;
   }
 
   start() {
@@ -31,9 +33,20 @@ export class WorkerManager {
       let job;
       while ((job = this.#queue.dequeue())) {
         try {
-          await processJob(job);
+          const result = await processJob(job);
+          if (this.#onResult) this.#onResult(job, result);
         } catch (err) {
-          console.error(`job ${job.id} failed:`, err.message);
+          console.error(`job ${job.id} failed (attempt ${job.attempts + 1}/${job.maxAttempts}):`, err.message);
+          const requeued = this.#queue.requeue(job);
+          if (requeued) {
+            // Requeue with backoff metadata but don't block the poll loop —
+            // other queued jobs can proceed while this one waits its turn.
+            const delay = Math.min(1000 * Math.pow(2, job.attempts - 1), 30000);
+            job._retryAfter = Date.now() + delay;
+            console.log(`job ${job.id} requeued, eligible after ${delay}ms`);
+          } else {
+            console.error(`job ${job.id} moved to dead-letter queue after ${job.maxAttempts} attempts`);
+          }
         }
       }
       await new Promise(resolve => {
