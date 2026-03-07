@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -158,6 +160,9 @@ type Server struct {
 	rl        *rateLimiter
 	authToken string // optional — set via AUTH_TOKEN env var
 	serverKey []byte // AES-256-GCM key for server-side envelope signing
+
+	workerURL    string // optional — set via WORKER_URL env var
+	workerClient *http.Client
 }
 
 // allowedOrigins returns the set of permitted WebSocket origins from the
@@ -210,6 +215,8 @@ func NewServer() *Server {
 		rl:        newRateLimiter(10, time.Second, 20),
 		authToken: os.Getenv("AUTH_TOKEN"),
 		serverKey: serverKey,
+		workerURL:    os.Getenv("WORKER_URL"),
+		workerClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -227,10 +234,15 @@ func main() {
 		go srv.connectRelay()
 	}
 
+	if srv.workerURL != "" {
+		go srv.cleanupLoop()
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/ws", srv.handleWebSocket)
 	mux.HandleFunc("/api/rooms", srv.handleRooms)
+	mux.HandleFunc("/api/rooms/", srv.handleRoomSub)
 
 	addr := fmt.Sprintf(":%s", port)
 
@@ -238,8 +250,12 @@ func main() {
 	tlsKey := os.Getenv("TLS_KEY")
 
 	httpSrv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown on SIGINT/SIGTERM
@@ -258,6 +274,9 @@ func main() {
 	}()
 
 	log.Printf("gateway listening on %s", addr)
+	if srv.workerURL != "" {
+		log.Printf("worker integration enabled: %s", srv.workerURL)
+	}
 	var err error
 	if tlsCert != "" && tlsKey != "" {
 		log.Printf("TLS enabled")
@@ -344,6 +363,52 @@ func (s *Server) forwardToRelay(env protocol.Envelope) {
 	}
 }
 
+// submitJob sends a job to the worker service.
+func (s *Server) submitJob(jobType string, data map[string]interface{}) error {
+	if s.workerURL == "" {
+		return fmt.Errorf("worker URL not configured")
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"type": jobType,
+		"data": data,
+	})
+	if err != nil {
+		return err
+	}
+	resp, err := s.workerClient.Post(s.workerURL+"/jobs", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("worker returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// cleanupLoop periodically submits room:cleanup jobs to the worker.
+func (s *Server) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		gatewayPort := os.Getenv("GATEWAY_PORT")
+		if gatewayPort == "" {
+			gatewayPort = "8080"
+		}
+		gatewayURL := fmt.Sprintf("http://localhost:%s", gatewayPort)
+
+		err := s.submitJob("room:cleanup", map[string]interface{}{
+			"gatewayURL": gatewayURL,
+		})
+		if err != nil {
+			log.Printf("failed to submit room:cleanup job: %v", err)
+		} else {
+			log.Printf("submitted room:cleanup job")
+		}
+	}
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -353,16 +418,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkAuth validates the bearer token if AUTH_TOKEN is configured.
+// Checks Authorization header first, then falls back to ?token= query param
+// (browsers cannot set custom headers on WebSocket connections).
 // Returns true if authorized.
 func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	if s.authToken == "" {
 		return true // no auth configured — dev mode
 	}
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// Try Authorization header first
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// Fall back to query parameter for WebSocket connections
+	if token == "" || token == r.Header.Get("Authorization") {
+		token = r.URL.Query().Get("token")
 	}
-	if token != s.authToken {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -378,16 +447,85 @@ func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	rooms := s.store.Rooms()
-	result := make([]map[string]interface{}, 0, len(rooms))
-	for _, name := range rooms {
+	snapshots := s.store.RoomsWithCounts()
+	result := make([]map[string]interface{}, 0, len(snapshots))
+	for _, snap := range snapshots {
 		result = append(result, map[string]interface{}{
-			"name":  name,
-			"count": s.store.Count(name),
+			"name":  snap.Name,
+			"count": snap.Count,
 		})
 	}
 	if err := json.NewEncoder(w).Encode(map[string]interface{}{"rooms": result, "count": len(result)}); err != nil {
 		log.Printf("rooms encode error: %v", err)
+	}
+}
+
+// handleRoomSub handles /api/rooms/{name}/info and /api/rooms/{name}/cleanup
+func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAuth(w, r) {
+		return
+	}
+
+	// Parse: /api/rooms/{name}/info or /api/rooms/{name}/cleanup
+	path := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	roomName, err := url.PathUnescape(parts[0])
+	if err != nil {
+		http.Error(w, "invalid room name encoding", http.StatusBadRequest)
+		return
+	}
+	action := parts[1]
+
+	switch action {
+	case "info":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		peers, lastActivity, exists := s.store.RoomInfo(roomName)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"peers":        peers,
+			"lastActivity": lastActivity,
+			"exists":       exists,
+		})
+
+	case "cleanup":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Force-disconnect all peers in this room
+		peerIDs := s.store.Peers(roomName)
+		for _, pid := range peerIDs {
+			s.connMu.Lock()
+			p, ok := s.conns[pid]
+			if ok {
+				delete(s.conns, pid)
+				delete(s.peerRooms, pid)
+			}
+			s.connMu.Unlock()
+
+			if ok {
+				s.store.Leave(roomName, pid)
+				p.closeSend()
+				p.conn.Close()
+			}
+		}
+		// If room still exists with 0 peers (stale tracking), force remove via Leave with dummy
+		s.store.Leave(roomName, "__cleanup__")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"room":         roomName,
+			"disconnected": len(peerIDs),
+		})
+
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
 	}
 }
 
@@ -446,13 +584,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("disconnected: %s", peerID)
 	}()
 
-	// Send periodic pings via control write (bypasses send queue)
+	// Send periodic pings via control write (bypasses send queue).
+	// stopPing signals the goroutine to exit when the connection closes.
+	pingDone := make(chan struct{})
+	stopPing := make(chan struct{})
 	go func() {
-		for range pingTicker.C {
-			if err := p.writeControl(websocket.PingMessage, nil); err != nil {
+		defer close(pingDone)
+		for {
+			select {
+			case <-stopPing:
 				return
+			case <-pingTicker.C:
+				if err := p.writeControl(websocket.PingMessage, nil); err != nil {
+					return
+				}
 			}
 		}
+	}()
+
+	defer func() {
+		close(stopPing)
+		<-pingDone
 	}()
 
 	for {
@@ -583,6 +735,21 @@ func (s *Server) sendError(p *peer, msg string) {
 	p.enqueue(data)
 }
 
+// signEnvelope computes an HMAC-SHA256 over the envelope's core fields
+// using the server key. The server can verify message integrity by
+// recomputing and comparing the signature.
+func (s *Server) signEnvelope(env *protocol.Envelope) {
+	sig := tccrypto.SignHMAC(
+		s.serverKey,
+		env.ID,
+		string(env.Type),
+		env.Room,
+		env.Payload,
+		fmt.Sprintf("%d", env.Timestamp),
+	)
+	env.Sig = fmt.Sprintf("%x", sig)
+}
+
 func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID string) {
 	peers := s.store.Peers(room)
 
@@ -597,6 +764,9 @@ func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID str
 		}
 	}
 	s.connMu.RUnlock()
+
+	// Sign the envelope with the server key for integrity verification
+	s.signEnvelope(&env)
 
 	data, err := json.Marshal(env)
 	if err != nil {
