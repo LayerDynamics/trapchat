@@ -45,8 +45,8 @@ function trackResult(job, result) {
       if (!['http:', 'https:'].includes(cbUrl.protocol)) {
         throw new Error(`disallowed protocol: ${cbUrl.protocol}`);
       }
-      if (!ALLOWED_CALLBACK_HOSTS.includes(cbUrl.hostname)) {
-        throw new Error(`disallowed callback host: ${cbUrl.hostname}`);
+      if (!ALLOWED_CALLBACK_HOSTS.includes(cbUrl.hostname) || (cbUrl.port && !['80', '443'].includes(cbUrl.port))) {
+        throw new Error(`disallowed callback host or port: ${cbUrl.host}`);
       }
       fetch(job.data.callbackURL, {
         method: 'POST',
