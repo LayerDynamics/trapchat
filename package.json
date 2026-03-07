@@ -15,6 +15,10 @@
     "build:frontend": "cd apps/trapchat && npm run build",
     "install:all": "npm install && cd apps/trapchat && npm install",
     "health": "curl -sf http://localhost:8080/health && echo ' gateway ok' ; curl -sf http://localhost:9001/health && echo ' relay ok' ; curl -sf http://localhost:9100/health && echo ' worker ok'",
+    "test": "npm run test:go && npm run test:worker",
+    "test:go": "(cd services/gateway && go test ./...) && (cd pkgs/go/storage && go test ./...)",
+    "test:worker": "cd services/worker && npm test",
+    "test:integration": "bash tests/integration/pipeline_test.sh",
     "clean": "rm -rf target node_modules apps/trapchat/node_modules apps/trapchat/dist"
   },
   "devDependencies": {
