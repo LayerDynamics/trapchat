@@ -481,9 +481,14 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
         room_name.to_string(),
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
+    let presence = Message::new(
+        MessageType::Presence,
+        room_name.to_string(),
+        Some(serde_json::json!({ "room": room_name, "count": count }).to_string()),
+    );
     info!("broadcasting presence: room={} count={} payload={:?}", room_name, count, presence.payload);
     let msg = tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({"type": "presence", "room": room_name, "count": count}).to_string().into(),
+        serde_json::to_string(&presence).expect("Failed to serialize presence message"),
     );
     for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
