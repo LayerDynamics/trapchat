@@ -11,6 +11,7 @@ import './App.css'
 
 const MAX_MESSAGES = 500
 const MAX_ROOM_NAME_LEN = 64
+const MAX_TEXT_LENGTH = 50000 // Cap decrypted text to prevent UI freezes
 
 function App() {
   const [view, setView] = useState('join')
@@ -250,6 +251,9 @@ function App() {
           let text
           try {
             text = await decryptWithRotation(data.payload)
+            if (text.length > MAX_TEXT_LENGTH) {
+              text = text.slice(0, MAX_TEXT_LENGTH) + '... [truncated]'
+            }
           } catch {
             text = '[encrypted message — key mismatch]'
           }
