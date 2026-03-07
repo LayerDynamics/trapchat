@@ -87,6 +87,31 @@ export async function deriveRoomKey(roomName, passphrase) {
   );
 }
 
+export async function encryptBytes(key, bytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: ALGO, iv },
+    key,
+    bytes
+  );
+  const result = new Uint8Array(iv.length + ciphertext.byteLength);
+  result.set(iv);
+  result.set(new Uint8Array(ciphertext), iv.length);
+  return uint8ToBase64(result);
+}
+
+export async function decryptBytes(key, encoded) {
+  const data = base64ToUint8(encoded);
+  const iv = data.slice(0, IV_LENGTH);
+  const ciphertext = data.slice(IV_LENGTH);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: ALGO, iv },
+    key,
+    ciphertext
+  );
+  return new Uint8Array(plaintext);
+}
+
 export async function exportKey(key) {
   const raw = await crypto.subtle.exportKey('raw', key);
   return uint8ToBase64(new Uint8Array(raw));
@@ -96,3 +121,94 @@ export async function importKey(base64) {
   const raw = base64ToUint8(base64);
   return crypto.subtle.importKey('raw', raw, ALGO, true, ['encrypt', 'decrypt']);
 }
+
+/**
+ * KeyRotator manages periodic key rotation for a room.
+ * When rotated, the old key is kept briefly to decrypt in-flight messages.
+ */
+export class KeyRotator {
+  #currentKey = null;
+  #previousKey = null;
+  #timer = null;
+  #onRotate = null;
+  #interval;
+
+  /**
+   * @param {object} opts
+   * @param {number} opts.interval - Rotation interval in ms (default: 30 min)
+   * @param {function} opts.onRotate - Called with (newKey, exportedKey) after rotation
+   */
+  constructor({ interval, onRotate } = {}) {
+    this.#interval = interval || 30 * 60 * 1000;
+    this.#onRotate = onRotate || null;
+  }
+
+  /** Start rotation with an initial key */
+  start(key) {
+    this.#currentKey = key;
+    this.#timer = setInterval(() => this.#rotate(), this.#interval);
+  }
+
+  stop() {
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = null;
+    }
+  }
+
+  get currentKey() {
+    return this.#currentKey;
+  }
+
+  get previousKey() {
+    return this.#previousKey;
+  }
+
+  async #rotate() {
+    this.#previousKey = this.#currentKey;
+    this.#currentKey = await generateRoomKey();
+    const exported = await exportKey(this.#currentKey);
+    if (this.#onRotate) {
+      this.#onRotate(this.#currentKey, exported);
+    }
+    // Clear previous key after 30s grace period for in-flight messages
+    setTimeout(() => {
+      this.#previousKey = null;
+    }, 30000);
+  }
+
+  /** Try decrypting with current key, fall back to previous key */
+  async decrypt(ciphertext) {
+    try {
+      return await decrypt(this.#currentKey, ciphertext);
+    } catch {
+      if (this.#previousKey) {
+        try {
+          return await decrypt(this.#previousKey, ciphertext);
+        } catch {
+          // Both keys failed
+        }
+      }
+      throw new Error('decryption failed');
+    }
+  }
+
+  /** Try decrypting bytes with current key, fall back to previous key */
+  async decryptBytes(ciphertext) {
+    try {
+      return await decryptBytesRaw(this.#currentKey, ciphertext);
+    } catch {
+      if (this.#previousKey) {
+        try {
+          return await decryptBytesRaw(this.#previousKey, ciphertext);
+        } catch {
+          // Both keys failed
+        }
+      }
+      throw new Error('decryption failed');
+    }
+  }
+}
+
+// Internal alias so KeyRotator can reference the module-level decryptBytes
+const decryptBytesRaw = decryptBytes;

@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import QRCode from 'qrcode'
 import { TrapChatClient } from './socket/client.js'
-import { generateRoomKey, exportKey, importKey, encrypt, decrypt, deriveRoomKey } from './lib/crypto.js'
+import { generateRoomKey, exportKey, importKey, encrypt, decrypt, deriveRoomKey, KeyRotator } from './lib/crypto.js'
+import { sendMedia, sendCanvas, MediaAssembler } from './lib/media.js'
 import './App.css'
 
 const MAX_MESSAGES = 500
 const MAX_ROOM_NAME_LEN = 64
+const ACCEPTED_FILE_TYPES = 'image/*,video/*,application/pdf'
 
 function App() {
   const [view, setView] = useState('join')
@@ -23,8 +25,17 @@ function App() {
   const [copied, setCopied] = useState(false)
   const [showQR, setShowQR] = useState(false)
   const [qrDataURL, setQrDataURL] = useState('')
+  const [uploadProgress, setUploadProgress] = useState(null)
+  const [downloadProgress, setDownloadProgress] = useState(null)
+  const fileInputRef = useRef(null)
+  const canvasRef = useRef(null)
+  const assemblerRef = useRef(null)
+  const rotatorRef = useRef(null)
   // Track whether disconnect was intentional to avoid conflicting with reconnect
   const intentionalDisconnectRef = useRef(false)
+
+  // Key rotation interval from env or default 30 minutes
+  const KEY_ROTATION_INTERVAL = parseInt(import.meta.env.VITE_KEY_ROTATION_INTERVAL || '1800000', 10)
 
   // Generate QR code data URL when share link changes
   useEffect(() => {
@@ -95,6 +106,10 @@ function App() {
     return () => {
       unsubsRef.current.forEach(fn => fn())
       unsubsRef.current = []
+      if (rotatorRef.current) {
+        rotatorRef.current.stop()
+        rotatorRef.current = null
+      }
       if (clientRef.current) {
         clientRef.current.disconnect()
         clientRef.current = null
@@ -142,7 +157,8 @@ function App() {
         const exported = await exportKey(key)
         const link = `${window.location.origin}${window.location.pathname}#${encodeURIComponent(room)}/${exported}`
         setShareLink(link)
-        window.location.hash = `${encodeURIComponent(room)}/${exported}`
+        // Set hash temporarily for share link, then clear to prevent key leaking via history/referrer
+        history.replaceState(null, '', window.location.pathname)
       }
       await client.connect()
       setStatus('connected')
@@ -150,6 +166,33 @@ function App() {
       // Remove previous listeners to prevent duplicates on rejoin
       unsubsRef.current.forEach(fn => fn())
       unsubsRef.current = []
+
+      // Initialize key rotator for periodic key rotation
+      if (rotatorRef.current) rotatorRef.current.stop()
+      rotatorRef.current = new KeyRotator({
+        interval: KEY_ROTATION_INTERVAL,
+        onRotate: (newKey) => {
+          keyRef.current = newKey
+          appendMessage({
+            id: crypto.randomUUID(),
+            text: '[key rotated — encryption key updated]',
+            time: new Date().toLocaleTimeString(),
+            system: true,
+          })
+        },
+      })
+      rotatorRef.current.start(keyRef.current)
+
+      // Initialize media assembler for receiving chunked files
+      if (assemblerRef.current) assemblerRef.current.destroy()
+      assemblerRef.current = new MediaAssembler({
+        onProgress: (transferId, received, total) => {
+          setDownloadProgress({ transferId, received, total })
+          if (received === total) {
+            setTimeout(() => setDownloadProgress(null), 500)
+          }
+        },
+      })
 
       unsubsRef.current.push(client.on('message', async (data) => {
         if (typeof data === 'object' && data.type === 'presence') {
@@ -162,7 +205,10 @@ function App() {
         } else if (typeof data === 'object' && data.type === 'chat') {
           let text
           try {
-            text = await decrypt(keyRef.current, data.payload)
+            // Use rotator to try current key, then fall back to previous key during rotation window
+            text = rotatorRef.current
+              ? await rotatorRef.current.decrypt(data.payload)
+              : await decrypt(keyRef.current, data.payload)
           } catch {
             text = '[encrypted message — key mismatch]'
           }
@@ -172,6 +218,28 @@ function App() {
             time: new Date().toLocaleTimeString(),
             error: text === '[encrypted message — key mismatch]',
           })
+        } else if (typeof data === 'object' && data.type === 'media') {
+          const result = await assemblerRef.current.handleChunk(data, keyRef.current)
+          if (!result) return
+          if (result.error) {
+            appendMessage({
+              id: crypto.randomUUID(),
+              text: result.message,
+              time: new Date().toLocaleTimeString(),
+              error: true,
+            })
+          } else if (result.complete) {
+            appendMessage({
+              id: crypto.randomUUID(),
+              time: new Date().toLocaleTimeString(),
+              media: {
+                url: result.url,
+                mimeType: result.mimeType,
+                fileName: result.fileName,
+                fileSize: result.fileSize,
+              },
+            })
+          }
         }
       }))
 
@@ -235,6 +303,75 @@ function App() {
     setInput('')
   }, [input, room, appendMessage])
 
+  const handleFileSelect = useCallback(async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = '' // reset for re-selection
+
+    const client = getClient()
+    try {
+      setUploadProgress({ sent: 0, total: 1 })
+      const result = await sendMedia(client, keyRef.current, room, file, (sent, total) => {
+        setUploadProgress({ sent, total })
+      })
+      setUploadProgress(null)
+      appendMessage({
+        id: crypto.randomUUID(),
+        time: new Date().toLocaleTimeString(),
+        own: true,
+        media: {
+          url: URL.createObjectURL(file),
+          mimeType: result.mimeType,
+          fileName: result.fileName,
+          fileSize: file.size,
+        },
+      })
+    } catch (err) {
+      setUploadProgress(null)
+      appendMessage({
+        id: crypto.randomUUID(),
+        text: `[upload failed: ${err.message}]`,
+        time: new Date().toLocaleTimeString(),
+        own: true,
+        error: true,
+      })
+    }
+  }, [room, appendMessage])
+
+  const handleCanvasShare = useCallback(async () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const client = getClient()
+    try {
+      setUploadProgress({ sent: 0, total: 1 })
+      const result = await sendCanvas(client, keyRef.current, room, canvas, (sent, total) => {
+        setUploadProgress({ sent, total })
+      })
+      setUploadProgress(null)
+      appendMessage({
+        id: crypto.randomUUID(),
+        time: new Date().toLocaleTimeString(),
+        own: true,
+        media: {
+          url: canvas.toDataURL('image/png'),
+          mimeType: result.mimeType,
+          fileName: result.fileName,
+          fileSize: result.fileSize,
+        },
+      })
+    } catch (err) {
+      setUploadProgress(null)
+      appendMessage({
+        id: crypto.randomUUID(),
+        text: `[canvas share failed: ${err.message}]`,
+        time: new Date().toLocaleTimeString(),
+        own: true,
+        error: true,
+      })
+    }
+  }, [room, appendMessage])
+
   const leaveRoom = useCallback(() => {
     const client = getClient()
     intentionalDisconnectRef.current = true
@@ -242,11 +379,21 @@ function App() {
     unsubsRef.current = []
     client.send('leave', room, null)
     client.disconnect()
+    if (assemblerRef.current) {
+      assemblerRef.current.destroy()
+      assemblerRef.current = null
+    }
+    if (rotatorRef.current) {
+      rotatorRef.current.stop()
+      rotatorRef.current = null
+    }
     setView('join')
     setMessages([])
     setRoom('')
     setStatus('disconnected')
     setShareLink('')
+    setUploadProgress(null)
+    setDownloadProgress(null)
     window.location.hash = ''
   }, [room])
 
@@ -314,17 +461,54 @@ function App() {
           )}
         </div>
       )}
+      {uploadProgress && (
+        <div className="upload-progress">
+          <div className="upload-progress-bar" style={{ width: `${(uploadProgress.sent / uploadProgress.total) * 100}%` }} />
+          <span className="upload-progress-text">sending {uploadProgress.sent}/{uploadProgress.total} chunks</span>
+        </div>
+      )}
+      {downloadProgress && (
+        <div className="download-progress">
+          <div className="download-progress-bar" style={{ width: `${(downloadProgress.received / downloadProgress.total) * 100}%` }} />
+          <span className="download-progress-text">receiving {downloadProgress.received}/{downloadProgress.total} chunks</span>
+        </div>
+      )}
       <div className="messages" role="log" aria-live="polite" aria-label="Chat messages">
         {messages.map(msg => (
           <div key={msg.id} className={`message ${msg.own ? 'own' : ''} ${msg.error ? 'error' : ''} ${msg.queued ? 'queued' : ''}`}>
-            <span className="msg-text">{msg.text}</span>
+            {msg.media ? (
+              <div className="media-preview">
+                {msg.media.mimeType.startsWith('image/') ? (
+                  <img src={msg.media.url} alt={msg.media.fileName} />
+                ) : msg.media.mimeType.startsWith('video/') ? (
+                  <video src={msg.media.url} controls preload="metadata" />
+                ) : (
+                  <a href={msg.media.url} download={msg.media.fileName} className="media-download">
+                    {msg.media.fileName} ({(msg.media.fileSize / 1024).toFixed(1)}KB)
+                  </a>
+                )}
+                <span className="media-filename">{msg.media.fileName}</span>
+              </div>
+            ) : (
+              <span className="msg-text">{msg.text}</span>
+            )}
             {msg.queued && <span className="msg-queued" aria-label="Message queued">queued</span>}
             <span className="msg-time">{msg.time}</span>
           </div>
         ))}
         <div ref={bottomRef} />
       </div>
+      <canvas ref={canvasRef} width={400} height={300} className="share-canvas" />
       <form onSubmit={sendMessage} className="send-form" aria-label="Send a message">
+        <input
+          type="file"
+          ref={fileInputRef}
+          accept={ACCEPTED_FILE_TYPES}
+          onChange={handleFileSelect}
+          hidden
+        />
+        <button type="button" className="attach-btn" onClick={() => fileInputRef.current?.click()} aria-label="Attach file">+</button>
+        <button type="button" className="canvas-btn" onClick={handleCanvasShare} aria-label="Share canvas">canvas</button>
         <input
           type="text"
           value={input}
