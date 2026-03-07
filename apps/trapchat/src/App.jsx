@@ -28,13 +28,27 @@ function App() {
 
   // Generate QR code data URL when share link changes
   useEffect(() => {
+    let cancelled = false
+
     if (shareLink) {
       QRCode.toDataURL(shareLink, { width: 200, margin: 2 })
-        .then(url => setQrDataURL(url))
-        .catch(() => setQrDataURL(''))
+        .then((url) => {
+          if (!cancelled) {
+            setQrDataURL(url)
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setQrDataURL('')
+          }
+        })
     } else {
       setQrDataURL('')
       setShowQR(false)
+    }
+
+    return () => {
+      cancelled = true
     }
   }, [shareLink])
 
