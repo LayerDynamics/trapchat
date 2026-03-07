@@ -112,9 +112,12 @@ BOGUS_RESP=$(curl -sf -X POST "$WORKER_URL/jobs" \
 BOGUS_ID=$(echo "$BOGUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
 
 # Wait for retries to exhaust (3 attempts with backoff)
-sleep 8
+for i in $(seq 1 10); do
+  DL_COUNT=$(curl -sf "$WORKER_URL/dead-letters" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('deadLetters',[]))) " 2>/dev/null || echo 0)
+  [ "$DL_COUNT" -gt 0 ] && break
+  sleep 1
+done
 
-DL_COUNT=$(curl -sf "$WORKER_URL/dead-letters" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('deadLetters',[])))")
 if [ "$DL_COUNT" -lt 1 ]; then
   echo "FAIL: expected at least 1 dead-letter entry, got $DL_COUNT"
   exit 1
