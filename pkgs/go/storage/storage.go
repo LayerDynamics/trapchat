@@ -10,6 +10,8 @@ type Room struct {
 	Name         string
 	Peers        map[string]string // peerID → nickname (empty string if no nickname)
 	LastActivity time.Time
+	TTLSeconds   int64
+	CreatedAt    time.Time
 }
 
 // Store is a thread-safe in-memory room registry.
@@ -25,19 +27,30 @@ func NewStore() *Store {
 
 // Join adds a peer to a room, creating the room if needed. Returns peer count.
 func (s *Store) Join(room, peerID string) int {
+	count, _ := s.JoinWithTTL(room, peerID, 0)
+	return count
+}
+
+// JoinWithTTL atomically joins a room (creating it if needed) and sets TTL on new rooms.
+// Returns (peerCount, isNewRoom). TTL is only applied when ttlSeconds > 0 and room is new.
+func (s *Store) JoinWithTTL(room, peerID string, ttlSeconds int64) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	r, ok := s.rooms[room]
-	if !ok {
-		r = &Room{Name: room, Peers: make(map[string]string)}
+	isNew := !ok
+	if isNew {
+		r = &Room{Name: room, Peers: make(map[string]string), CreatedAt: time.Now()}
+		if ttlSeconds > 0 {
+			r.TTLSeconds = ttlSeconds
+		}
 		s.rooms[room] = r
 	}
 	if _, exists := r.Peers[peerID]; !exists {
 		r.Peers[peerID] = ""
 	}
 	r.LastActivity = time.Now()
-	return len(r.Peers)
+	return len(r.Peers), isNew
 }
 
 // Leave removes a peer from a room. Returns remaining count.
@@ -178,4 +191,41 @@ func (s *Store) RoomInfo(name string) (peers int, lastActivity time.Time, exists
 		return 0, time.Time{}, false
 	}
 	return len(r.Peers), r.LastActivity, true
+}
+
+// SetRoomTTL sets the TTL in seconds for a room.
+func (s *Store) SetRoomTTL(room string, ttlSeconds int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if r, ok := s.rooms[room]; ok {
+		r.TTLSeconds = ttlSeconds
+	}
+}
+
+// RoomTTL returns TTL seconds, creation time, and existence for a room.
+func (s *Store) RoomTTL(room string) (ttlSeconds int64, createdAt time.Time, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	r, ok := s.rooms[room]
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	return r.TTLSeconds, r.CreatedAt, true
+}
+
+// ExpiredRooms returns room names where TTL > 0 and current time exceeds CreatedAt + TTL.
+func (s *Store) ExpiredRooms() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	var expired []string
+	for name, r := range s.rooms {
+		if r.TTLSeconds > 0 && now.After(r.CreatedAt.Add(time.Duration(r.TTLSeconds)*time.Second)) {
+			expired = append(expired, name)
+		}
+	}
+	return expired
 }

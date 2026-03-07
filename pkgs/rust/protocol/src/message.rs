@@ -14,6 +14,8 @@ pub enum MessageType {
     Typing,
     Receipt,
     KeyRotation,
+    Signal,
+    Welcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,8 +75,18 @@ mod tests {
     }
 
     #[test]
+    fn signal_roundtrip() {
+        let msg = Message::new(MessageType::Signal, "room1".into(), Some(r#"{"signalType":"offer","data":{}}"#.into()));
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.msg_type, MessageType::Signal);
+        assert_eq!(back.room, "room1");
+        assert_eq!(back.payload, Some(r#"{"signalType":"offer","data":{}}"#.to_string()));
+    }
+
+    #[test]
     fn all_message_types_deserialize() {
-        for t in ["join", "leave", "chat", "media", "presence", "error", "typing", "receipt", "key_rotation"] {
+        for t in ["join", "leave", "chat", "media", "presence", "error", "typing", "receipt", "key_rotation", "signal", "welcome"] {
             let json = format!(r#"{{"type":"{}","room":"r","timestamp":0}}"#, t);
             let msg: Message = serde_json::from_str(&json).unwrap();
             assert_eq!(msg.room, "r");

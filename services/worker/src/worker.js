@@ -1,8 +1,26 @@
 const logger = {
   info: (msg, data) => console.log(JSON.stringify({ level: 'info', msg, ...data, time: new Date().toISOString() })),
   warn: (msg, data) => console.log(JSON.stringify({ level: 'warn', msg, ...data, time: new Date().toISOString() })),
-  error: (msg, data) => console.log(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
+  error: (msg, data) => console.error(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
 };
+
+const FETCH_TIMEOUT = 15_000;
+const ALLOWED_GATEWAY_HOSTS = (process.env.ALLOWED_GATEWAY_HOSTS || 'localhost,127.0.0.1').split(',').map(h => h.trim());
+const ALLOWED_PORTS = ['80', '443', '8080'];
+
+/**
+ * Validates a gateway URL against SSRF allowlist. Throws on invalid URL.
+ * @returns {URL} the parsed URL
+ */
+function validateGatewayURL(gatewayURL) {
+  if (!gatewayURL) throw new Error('gatewayURL is required');
+  const parsed = new URL(gatewayURL);
+  const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+  if (!['http:', 'https:'].includes(parsed.protocol) || !ALLOWED_GATEWAY_HOSTS.includes(parsed.hostname) || !ALLOWED_PORTS.includes(port)) {
+    throw new Error(`disallowed gatewayURL host or port: ${parsed.host}`);
+  }
+  return parsed;
+}
 
 export async function processJob(job) {
   switch (job.type) {
@@ -26,32 +44,28 @@ export async function processJob(job) {
 
       // Forward chunked results back to the gateway for room delivery
       if (gatewayURL && roomId) {
-        const ALLOWED_GATEWAY_HOSTS = (process.env.ALLOWED_GATEWAY_HOSTS || 'localhost,127.0.0.1').split(',').map(h => h.trim());
-        const parsedGw = new URL(gatewayURL);
-        const gwPort = parsedGw.port || (parsedGw.protocol === 'https:' ? '443' : '80');
-        if (['http:', 'https:'].includes(parsedGw.protocol) && ALLOWED_GATEWAY_HOSTS.includes(parsedGw.hostname) && ['80', '443', '8080'].includes(gwPort)) {
-          for (const chunk of result) {
-            try {
-              await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(roomId)}/broadcast`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  type: 'media',
-                  payload: JSON.stringify({
-                    transferId: transferId || job.id,
-                    seq: chunk.seq,
-                    total: chunk.total,
-                    mimeType,
-                    fileName,
-                    fileSize,
-                    chunk: chunk.data,
-                  }),
+        validateGatewayURL(gatewayURL);
+        for (const chunk of result) {
+          try {
+            await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(roomId)}/broadcast`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'media',
+                payload: JSON.stringify({
+                  transferId: transferId || job.id,
+                  seq: chunk.seq,
+                  total: chunk.total,
+                  mimeType,
+                  fileName,
+                  fileSize,
+                  chunk: chunk.data,
                 }),
-                signal: AbortSignal.timeout(15_000),
-              });
-            } catch (err) {
-              logger.error('media:chunk forward failed', { jobId: job.id, seq: chunk.seq, error: err.message });
-            }
+              }),
+              signal: AbortSignal.timeout(FETCH_TIMEOUT),
+            });
+          } catch (err) {
+            logger.error('media:chunk forward failed', { jobId: job.id, seq: chunk.seq, error: err.message });
           }
         }
       }
@@ -61,37 +75,56 @@ export async function processJob(job) {
 
     case 'room:cleanup': {
       logger.info('processing room cleanup', { jobId: job.id });
-      const ALLOWED_GATEWAY_HOSTS = (process.env.ALLOWED_GATEWAY_HOSTS || 'localhost,127.0.0.1').split(',').map(h => h.trim());
       const { gatewayURL } = job.data || {};
-      if (!gatewayURL) {
-        throw new Error('room:cleanup requires gatewayURL');
-      }
-      const parsedGw = new URL(gatewayURL);
-      const gwPort = parsedGw.port || (parsedGw.protocol === 'https:' ? '443' : '80');
-      if (!['http:', 'https:'].includes(parsedGw.protocol) || !ALLOWED_GATEWAY_HOSTS.includes(parsedGw.hostname) || !['80', '443', '8080'].includes(gwPort)) {
-        throw new Error(`disallowed gatewayURL host or port: ${parsedGw.host}`);
-      }
-
-      const FETCH_TIMEOUT = 15_000; // 15s timeout for all outbound requests
+      validateGatewayURL(gatewayURL);
 
       // Fetch room list
       const roomsRes = await fetch(`${gatewayURL}/api/rooms`, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
       if (!roomsRes.ok) throw new Error(`failed to fetch rooms: ${roomsRes.status}`);
       const { rooms } = await roomsRes.json();
 
-      let cleaned = 0;
-      const staleThreshold = 30 * 60 * 1000; // 30 minutes
+      const defaultStaleThreshold = 30 * 60 * 1000; // 30 minutes
+      const CONCURRENCY = 10;
 
-      for (const room of rooms) {
-        const infoRes = await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(room.name)}/info`, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-        if (!infoRes.ok) continue;
-        const info = await infoRes.json();
+      // Check each room for staleness — returns true if it should be cleaned
+      async function shouldCleanRoom(room) {
+        try {
+          const infoRes = await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(room.name)}/info`, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+          if (!infoRes.ok) return false;
+          const info = await infoRes.json();
 
-        const idle = Date.now() - new Date(info.lastActivity).getTime();
-        if (info.peers === 0 && idle > staleThreshold) {
-          const cleanRes = await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(room.name)}/cleanup`, { method: 'POST', signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-          if (cleanRes.ok) cleaned++;
+          // Check per-room TTL first
+          try {
+            const ttlRes = await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(room.name)}/ttl`, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+            if (ttlRes.ok) {
+              const ttlData = await ttlRes.json();
+              if (ttlData.ttlSeconds > 0 && ttlData.expiresAt > 0 && Date.now() > ttlData.expiresAt) {
+                return true;
+              }
+            }
+          } catch {
+            // TTL endpoint unavailable, fall through to default
+          }
+
+          const idle = Date.now() - new Date(info.lastActivity).getTime();
+          return info.peers === 0 && idle > defaultStaleThreshold;
+        } catch {
+          return false;
         }
+      }
+
+      // Process rooms in parallel batches
+      let cleaned = 0;
+      for (let i = 0; i < rooms.length; i += CONCURRENCY) {
+        const batch = rooms.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(batch.map(async (room) => {
+          if (await shouldCleanRoom(room)) {
+            const cleanRes = await fetch(`${gatewayURL}/api/rooms/${encodeURIComponent(room.name)}/cleanup`, { method: 'POST', signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+            return cleanRes.ok;
+          }
+          return false;
+        }));
+        cleaned += results.filter(r => r.status === 'fulfilled' && r.value).length;
       }
 
       const result = { checked: rooms.length, cleaned };
