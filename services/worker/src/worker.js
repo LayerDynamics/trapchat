@@ -3,8 +3,8 @@ export async function processJob(job) {
     case 'media:chunk': {
       console.log(`processing media chunk: ${job.id}`);
       const { payload, chunkSize, roomId } = job.data || {};
-      if (!payload || !chunkSize) {
-        throw new Error('media:chunk requires payload and chunkSize');
+      if (!payload || typeof chunkSize !== 'number' || chunkSize <= 0) {
+        throw new Error('media:chunk requires payload and positive chunkSize');
       }
       const rawBytes = Buffer.from(payload, 'base64');
       const chunks = [];
