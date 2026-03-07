@@ -1,15 +1,106 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::accept_async;
+use tokio::sync::{mpsc, RwLock, Mutex};
+use tokio_tungstenite::accept_hdr_async;
 use tracing::{info, warn, error};
 use trapchat_io::Frame;
 use trapchat_protocol::{Message, MessageType, RoomEvent};
 
+/// Frame type constants for the binary framing protocol.
+const FRAME_TYPE_MESSAGE: u8 = 1;
+const FRAME_TYPE_EVENT: u8 = 2;
+
+/// Relay-specific error types.
+#[derive(Debug, thiserror::Error)]
+enum RelayError {
+    #[error("websocket error: {0}")]
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("room validation: {0}")]
+    RoomValidation(String),
+
+    #[error("connection limit reached: {current}/{max}")]
+    ConnectionLimit { current: usize, max: usize },
+
+    #[error("room limit reached: {current}/{max}")]
+    RoomLimit { current: usize, max: usize },
+
+    #[error("frame error: {0}")]
+    Frame(#[from] trapchat_io::IoError),
+}
+
+/// Encode a Message into a Frame for structured logging or binary transport.
+fn frame_message(msg: &Message) -> Result<Frame, RelayError> {
+    let payload = serde_json::to_vec(msg)?;
+    Ok(Frame::new(FRAME_TYPE_MESSAGE, payload))
+}
+
+/// Encode a RoomEvent into a Frame for structured logging or binary transport.
+fn frame_event(event: &RoomEvent) -> Result<Frame, RelayError> {
+    let payload = serde_json::to_vec(event)?;
+    Ok(Frame::new(FRAME_TYPE_EVENT, payload))
+}
+
 /// Bounded channel capacity per peer. Slow consumers are disconnected when full.
 const PEER_CHANNEL_CAP: usize = 256;
+/// Maximum number of concurrent rooms to prevent memory exhaustion.
+const MAX_ROOMS: usize = 10_000;
+/// Maximum concurrent connections.
+const MAX_CONNECTIONS: usize = 10_000;
+/// Max new connections per IP per second.
+const MAX_CONN_PER_IP_PER_SEC: usize = 10;
+/// Maximum room name length in Unicode scalar values.
+const MAX_ROOM_NAME_LEN: usize = 64;
+
+/// Validate room name: must be non-empty, within length limit, and contain only
+/// letters, numbers, spaces, hyphens, underscores, and dots (matching gateway rules).
+fn validate_room_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("room name is required");
+    }
+    if name.chars().count() > MAX_ROOM_NAME_LEN {
+        return Err("room name too long");
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.') {
+        return Err("room name contains invalid characters");
+    }
+    Ok(())
+}
+
+/// Per-IP connection rate limiter using a sliding window.
+struct IpRateLimiter {
+    buckets: HashMap<IpAddr, Vec<Instant>>,
+}
+
+impl IpRateLimiter {
+    fn new() -> Self {
+        Self { buckets: HashMap::new() }
+    }
+
+    fn allow(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(1);
+        let timestamps = self.buckets.entry(ip).or_default();
+        timestamps.retain(|t| now.duration_since(*t) < window);
+        if timestamps.len() >= MAX_CONN_PER_IP_PER_SEC {
+            return false;
+        }
+        timestamps.push(now);
+        true
+    }
+
+    /// Remove entries with no recent timestamps to prevent unbounded growth.
+    fn prune(&mut self) {
+        self.buckets.retain(|_, v| !v.is_empty());
+    }
+}
 
 type PeerTx = mpsc::Sender<tokio_tungstenite::tungstenite::Message>;
 type Room = Arc<RwLock<HashMap<String, PeerTx>>>;
@@ -31,16 +122,99 @@ async fn main() {
     info!("relay listening on {}", addr);
 
     let rooms: RoomMap = Arc::new(RwLock::new(HashMap::new()));
+    let conn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ip_limiter = Arc::new(Mutex::new(IpRateLimiter::new()));
 
-    while let Ok((stream, peer)) = listener.accept().await {
+    let allowed_origins: Vec<String> = std::env::var("RELAY_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| String::new())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Periodically prune stale IP rate limiter entries
+    {
+        let limiter = ip_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                limiter.lock().await.prune();
+            }
+        });
+    }
+
+    let shutdown_signal = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received shutdown signal, stopping relay...");
+    };
+    tokio::pin!(shutdown_signal);
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => match result {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("accept error: {}", e);
+                    continue;
+                }
+            },
+            _ = &mut shutdown_signal => {
+                info!("relay shutting down gracefully");
+                break;
+            }
+        };
+        let current = conn_count.load(std::sync::atomic::Ordering::Relaxed);
+        if current >= MAX_CONNECTIONS {
+            let relay_err = RelayError::ConnectionLimit { current, max: MAX_CONNECTIONS };
+            warn!("{}, rejecting {}", relay_err, peer);
+            drop(stream);
+            continue;
+        }
+
+        // Per-IP rate limit on new connections
+        {
+            let mut limiter = ip_limiter.lock().await;
+            if !limiter.allow(peer.ip()) {
+                warn!("per-IP connection rate limit exceeded for {}, rejecting", peer.ip());
+                drop(stream);
+                continue;
+            }
+        }
+
+        conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         info!("new connection from {}", peer);
         let rooms = rooms.clone();
-        tokio::spawn(handle_connection(stream, rooms));
+        let conn_count = conn_count.clone();
+        let allowed_origins = allowed_origins.clone();
+        tokio::spawn(async move {
+            handle_connection(stream, rooms, &allowed_origins).await;
+            conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
-    let ws = match accept_async(stream).await {
+async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowed_origins: &[String]) {
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    let allowed = allowed_origins.to_vec();
+    let callback = |req: &Request, response: Response| -> Result<Response, tokio_tungstenite::tungstenite::http::Response<Option<String>>> {
+        if !allowed.is_empty() {
+            let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if !allowed.iter().any(|o| o == origin) {
+                warn!("rejected origin: {}", origin);
+                let reject = tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("forbidden origin".to_string()))
+                    .unwrap();
+                return Err(reject);
+            }
+        }
+        Ok(response)
+    };
+
+    let ws = match accept_hdr_async(stream, callback).await {
         Ok(ws) => ws,
         Err(e) => {
             error!("websocket handshake failed: {}", e);
@@ -68,13 +242,11 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
         match msg {
             Ok(msg) if msg.is_text() || msg.is_binary() => {
                 let data = msg.into_data();
-                // Validate size via Frame (enforces MAX_FRAME_SIZE)
-                let frame = Frame::new(1, data);
-                if frame.encode().len() > 1024 * 1024 {
-                    warn!("oversized message from {}, dropping", peer_id);
+                // Reject oversized messages before any further allocation
+                if data.len() > 1024 * 1024 {
+                    warn!("oversized message from {} ({} bytes), dropping", peer_id, data.len());
                     continue;
                 }
-                let data = frame.payload;
                 let decoded: Message = match serde_json::from_slice(&data) {
                     Ok(m) => m,
                     Err(_) => {
@@ -82,6 +254,26 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
                         continue;
                     }
                 };
+
+                // Validate room name for types that reference a room
+                match decoded.msg_type {
+                    MessageType::Join | MessageType::Leave | MessageType::Chat | MessageType::Media => {
+                        if let Err(reason) = validate_room_name(&decoded.room) {
+                            let relay_err = RelayError::RoomValidation(reason.to_string());
+                            warn!("from {}: {}", peer_id, relay_err);
+                            let err = Message::new(
+                                MessageType::Error,
+                                String::new(),
+                                Some(reason.to_string()),
+                            );
+                            if let Ok(data) = serde_json::to_string(&err) {
+                                let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data.into()));
+                            }
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
 
                 match decoded.msg_type {
                     MessageType::Join => {
@@ -94,6 +286,19 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
                         let room_arc = {
                             let mut map = rooms.write().await;
                             let is_new = !map.contains_key(&room_name);
+                            if is_new && map.len() >= MAX_ROOMS {
+                                let relay_err = RelayError::RoomLimit { current: map.len(), max: MAX_ROOMS };
+                                warn!("{}", relay_err);
+                                let err = Message::new(
+                                    MessageType::Error,
+                                    room_name.clone(),
+                                    Some("room limit reached".to_string()),
+                                );
+                                if let Ok(data) = serde_json::to_string(&err) {
+                                    let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data.into()));
+                                }
+                                continue;
+                            }
                             let room_arc = map.entry(room_name.clone())
                                 .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
                                 .clone();
@@ -101,7 +306,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
                                 let event = RoomEvent::Created {
                                     room: room_name.clone(),
                                 };
-                                info!("{:?}", event);
+                                if let Ok(frame) = frame_event(&event) {
+                                    info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(), String::from_utf8_lossy(&frame.payload));
+                                }
+
                             }
                             room_arc
                         };
@@ -116,7 +324,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap) {
                             room: room_name.clone(),
                             peer_count,
                         };
-                        info!("{:?}", event);
+                        if let Ok(frame) = frame_event(&event) {
+                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
+                                serde_json::to_string(&event).unwrap_or_default());
+                        }
                         broadcast_presence(&rooms, &room_name).await;
                     }
                     MessageType::Chat | MessageType::Media => {
@@ -169,7 +380,10 @@ async fn leave_room(rooms: &RoomMap, room_name: &str, peer_id: &str) {
         room: room_name.to_string(),
         peer_count: count,
     };
-    info!("{:?}", event);
+    if let Ok(frame) = frame_event(&event) {
+                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
+                                serde_json::to_string(&event).unwrap_or_default());
+                        }
 
     if count == 0 {
         // Quick check without the outer write lock to avoid blocking all rooms
@@ -189,7 +403,10 @@ async fn leave_room(rooms: &RoomMap, room_name: &str, peer_id: &str) {
                     let event = RoomEvent::Destroyed {
                         room: room_name.to_string(),
                     };
-                    info!("{:?}", event);
+                    if let Ok(frame) = frame_event(&event) {
+                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
+                                serde_json::to_string(&event).unwrap_or_default());
+                        }
                 }
             }
         }
@@ -204,16 +421,28 @@ async fn fan_out_msg(rooms: &RoomMap, room_name: &str, sender_id: &str, data: &[
             None => return,
         }
     };
-    let room = room_arc.read().await;
     let msg = match String::from_utf8(data.to_vec()) {
         Ok(text) => tokio_tungstenite::tungstenite::Message::Text(text.into()),
         Err(e) => tokio_tungstenite::tungstenite::Message::Binary(e.into_bytes().into()),
     };
-    for (id, tx) in room.iter() {
-        if id != sender_id {
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
-                warn!("slow consumer {}, dropping message", id);
+    let slow_peers = {
+        let room = room_arc.read().await;
+        let mut slow = Vec::new();
+        for (id, tx) in room.iter() {
+            if id != sender_id {
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
+                    warn!("slow consumer {}, disconnecting", id);
+                    slow.push(id.clone());
+                }
             }
+        }
+        slow
+    };
+    // Disconnect slow consumers by removing them from the room
+    if !slow_peers.is_empty() {
+        let mut room = room_arc.write().await;
+        for id in &slow_peers {
+            room.remove(id);
         }
     }
 }
@@ -226,19 +455,26 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
             None => return,
         }
     };
-    let room = room_arc.read().await;
-    let count = room.len();
+    // Collect senders and count under lock, then drop lock before sending
+    let (senders, count) = {
+        let room = room_arc.read().await;
+        let count = room.len();
+        let senders: Vec<(String, PeerTx)> = room.iter().map(|(id, tx)| (id.clone(), tx.clone())).collect();
+        (senders, count)
+    };
     let presence = Message::new(
         MessageType::Presence,
         room_name.to_string(),
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
-    let data = match serde_json::to_string(&presence) {
-        Ok(d) => d,
-        Err(_) => return,
+    let msg = match frame_message(&presence) {
+        Ok(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes),
+        Err(e) => {
+            warn!("failed to frame presence message: {}", e);
+            return;
+        }
     };
-    let msg = tokio_tungstenite::tungstenite::Message::Text(data.into());
-    for (id, tx) in room.iter() {
+    for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
             warn!("slow consumer {} during presence broadcast, dropping", id);
         }
