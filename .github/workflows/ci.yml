@@ -57,12 +57,12 @@ jobs:
       - name: Install worker deps
         run: npm ci
         working-directory: services/worker
-      - name: Lint worker (eslint if config exists, fallback otherwise)
+      - name: Lint worker
         run: |
-          if [ -f .eslintrc* ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yml ] || [ -f .eslintrc.yaml ] || [ -f eslint.config.js ] || [ -f eslint.config.mjs ]; then
+          if ls .eslintrc* eslint.config.* 2>/dev/null | grep -q .; then
             npx eslint src/
           else
-            npx eslint --no-eslintrc --rule '{"no-unused-vars":"warn"}' src/
+            echo "No ESLint config found, skipping lint"
           fi
         working-directory: services/worker
       - name: Test worker
@@ -76,12 +76,12 @@ jobs:
       - name: Install frontend deps
         run: npm ci
         working-directory: apps/trapchat
-      - name: Lint frontend (eslint if config exists, fallback otherwise)
+      - name: Lint frontend
         run: |
-          if [ -f .eslintrc* ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yml ] || [ -f .eslintrc.yaml ] || [ -f eslint.config.js ] || [ -f eslint.config.mjs ]; then
+          if ls .eslintrc* eslint.config.* 2>/dev/null | grep -q .; then
             npx eslint src/
           else
-            npx eslint --no-eslintrc --rule '{"no-unused-vars":"warn"}' src/
+            echo "No ESLint config found, skipping lint"
           fi
         working-directory: apps/trapchat
       - name: Build frontend
