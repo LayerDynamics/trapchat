@@ -467,16 +467,13 @@ async fn broadcast_presence(rooms: &RoomMap, room_name: &str) {
         room_name.to_string(),
         Some(serde_json::json!({"room": room_name, "count": count}).to_string()),
     );
-    // Validate the message can be framed before broadcasting
-    if let Err(e) = frame_message(&presence) {
-        warn!("failed to frame presence message: {}", e);
-        return;
-    }
-    let data = match serde_json::to_string(&presence) {
-        Ok(d) => d,
-        Err(_) => return,
+    let msg = match frame_message(&presence) {
+        Ok(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes),
+        Err(e) => {
+            warn!("failed to frame presence message: {}", e);
+            return;
+        }
     };
-    let msg = tokio_tungstenite::tungstenite::Message::Text(data.into());
     for (id, tx) in &senders {
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg.clone()) {
             warn!("slow consumer {} during presence broadcast, dropping", id);
