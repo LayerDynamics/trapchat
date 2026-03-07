@@ -212,6 +212,85 @@ func TestSetNicknameNonexistentRoom(t *testing.T) {
 	s.SetNickname("nope", "peer1", "alice")
 }
 
+func TestSetRoomTTL(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	s.SetRoomTTL("room1", 3600)
+	ttl, createdAt, exists := s.RoomTTL("room1")
+	if !exists || ttl != 3600 {
+		t.Fatalf("expected TTL 3600, got %d, exists=%v", ttl, exists)
+	}
+	if createdAt.IsZero() {
+		t.Fatal("expected non-zero CreatedAt")
+	}
+}
+
+func TestRoomTTLNonexistent(t *testing.T) {
+	s := NewStore()
+	_, _, exists := s.RoomTTL("nope")
+	if exists {
+		t.Fatal("expected not exists")
+	}
+}
+
+func TestExpiredRooms(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	s.SetRoomTTL("room1", 1) // 1 second TTL
+	// Backdate creation
+	s.mu.Lock()
+	s.rooms["room1"].CreatedAt = time.Now().Add(-2 * time.Second)
+	s.mu.Unlock()
+
+	expired := s.ExpiredRooms()
+	if len(expired) != 1 || expired[0] != "room1" {
+		t.Fatalf("expected room1 expired, got %v", expired)
+	}
+}
+
+func TestExpiredRoomsNoTTL(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	// No TTL set (0) — should not expire
+	expired := s.ExpiredRooms()
+	if len(expired) != 0 {
+		t.Fatalf("expected no expired rooms, got %v", expired)
+	}
+}
+
+func TestExpiredRoomsNotYetExpired(t *testing.T) {
+	s := NewStore()
+	s.Join("room1", "peer1")
+	s.SetRoomTTL("room1", 86400) // 24 hours
+	expired := s.ExpiredRooms()
+	if len(expired) != 0 {
+		t.Fatalf("expected no expired rooms, got %v", expired)
+	}
+}
+
+func TestJoinSetsCreatedAt(t *testing.T) {
+	s := NewStore()
+	before := time.Now()
+	s.Join("room1", "peer1")
+	_, createdAt, exists := s.RoomTTL("room1")
+	if !exists {
+		t.Fatal("room should exist")
+	}
+	if createdAt.Before(before) {
+		t.Error("CreatedAt should be >= before")
+	}
+}
+
+func TestSetRoomTTLNonexistentRoom(t *testing.T) {
+	s := NewStore()
+	// Should not panic and should be a no-op
+	s.SetRoomTTL("nonexistent", 3600)
+	_, _, exists := s.RoomTTL("nonexistent")
+	if exists {
+		t.Fatal("SetRoomTTL on nonexistent room should not create the room")
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	s := NewStore()
 	var wg sync.WaitGroup

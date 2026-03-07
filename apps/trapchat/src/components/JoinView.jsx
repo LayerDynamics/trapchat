@@ -1,6 +1,6 @@
 const MAX_ROOM_NAME_LEN = 64
 
-export default function JoinView({ room, setRoom, nickname, setNickname, passphrase, setPassphrase, onJoin, status }) {
+export default function JoinView({ room, setRoom, nickname, setNickname, passphrase, setPassphrase, ttl, setTtl, onJoin, status }) {
   return (
     <div className="container" role="main">
       <h1>trapchat</h1>
@@ -30,6 +30,18 @@ export default function JoinView({ room, setRoom, nickname, setNickname, passphr
           placeholder="passphrase (optional)"
           aria-label="Room passphrase"
         />
+        <select
+          value={ttl}
+          onChange={(e) => setTtl(Number(e.target.value))}
+          aria-label="Room expiry"
+          className="ttl-select"
+        >
+          <option value={0}>no expiry</option>
+          <option value={900}>15 minutes</option>
+          <option value={3600}>1 hour</option>
+          <option value={14400}>4 hours</option>
+          <option value={86400}>24 hours</option>
+        </select>
         <button type="submit">join</button>
       </form>
       <p className="status" aria-live="polite">{status}</p>

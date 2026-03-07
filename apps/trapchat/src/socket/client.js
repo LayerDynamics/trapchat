@@ -11,6 +11,7 @@ export class TrapChatClient {
   #reconnectTimer = null;
   #lastRoom = null;
   #pendingQueue = [];
+  #peerId = null;
 
   constructor(url) {
     this.#url = url || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
@@ -46,6 +47,9 @@ export class TrapChatClient {
       this.#ws.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data);
+          if (data.type === 'welcome' && data.id) {
+            this.#peerId = data.id;
+          }
           this.#emit('message', data);
           if (data.type) {
             this.#emit(data.type, data);
@@ -148,6 +152,30 @@ export class TrapChatClient {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
+  }
+
+  /** Send a raw pre-serialized message string. */
+  sendRaw(msg) {
+    if (this.#ws && this.#ws.readyState === WebSocket.OPEN) {
+      this.#ws.send(msg)
+      return true
+    }
+    return false
+  }
+
+  /** Emit an event externally (e.g., from WebRTC data channel). */
+  emit(event, data) {
+    this.#emit(event, data)
+  }
+
+  /** Emit a P2P event with namespace prefix to avoid collisions with server events. */
+  emitP2P(event, data) {
+    this.#emit(`p2p:${event}`, data)
+  }
+
+  /** Server-assigned peer ID (available after connect). */
+  get peerId() {
+    return this.#peerId;
   }
 
   get connected() {

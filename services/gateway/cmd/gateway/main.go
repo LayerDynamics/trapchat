@@ -29,6 +29,12 @@ const (
 	peerSendBufSize  = 64
 	writeWaitTimeout = 10 * time.Second
 	maxRooms         = 10000 // Maximum concurrent rooms to prevent DoS via unbounded room creation
+
+	// Allowed room TTL values (seconds)
+	ttl15Min  int64 = 900
+	ttl1Hour  int64 = 3600
+	ttl4Hour  int64 = 14400
+	ttl24Hour int64 = 86400
 )
 
 // peer wraps a websocket connection with a buffered write queue.
@@ -198,6 +204,7 @@ type Server struct {
 
 	rl        *rateLimiter
 	typingRL  *rateLimiter // separate rate limiter for typing indicators
+	signalRL  *rateLimiter // WebRTC signaling rate limiter (higher burst for ICE trickle)
 	authToken string // optional — set via AUTH_TOKEN env var
 	serverKey []byte // AES-256-GCM key for server-side envelope signing
 
@@ -257,6 +264,7 @@ func NewServer() *Server {
 		// 10 messages per second, burst of 20
 		rl:        newRateLimiter(10, time.Second, 20),
 		typingRL:  newRateLimiter(1, 2*time.Second, 3),
+		signalRL:  newRateLimiter(50, time.Second, 100), // ICE trickle needs high burst
 		authToken: os.Getenv("AUTH_TOKEN"),
 		serverKey: serverKey,
 		workerURL:    os.Getenv("WORKER_URL"),
@@ -306,6 +314,8 @@ func main() {
 	if srv.workerURL != "" {
 		go srv.cleanupLoop()
 	}
+
+	go srv.ttlExpiryLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
@@ -501,6 +511,49 @@ func (s *Server) submitJob(jobType string, data map[string]interface{}) error {
 		return fmt.Errorf("worker returned status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ttlExpiryLoop checks for expired rooms every 30 seconds and disconnects all peers.
+func (s *Server) ttlExpiryLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		expired := s.store.ExpiredRooms()
+		for _, roomName := range expired {
+			slog.Info("room TTL expired", "room", roomName)
+			// Broadcast system message before disconnecting
+			sysPayload := `{"text":"room expired — TTL reached","encrypted":false}`
+			sysEnv := protocol.Envelope{
+				Type:      protocol.TypeChat,
+				Room:      roomName,
+				Payload:   sysPayload,
+				ID:        "__system__",
+				Timestamp: time.Now().UnixMilli(),
+			}
+			s.broadcast(roomName, sysEnv, "")
+
+			// Disconnect all peers
+			peerIDs := s.store.Peers(roomName)
+			for _, pid := range peerIDs {
+				s.connMu.Lock()
+				p, ok := s.conns[pid]
+				if ok {
+					delete(s.conns, pid)
+					delete(s.peerRooms, pid)
+				}
+				s.connMu.Unlock()
+
+				if ok {
+					s.store.Leave(roomName, pid)
+					p.closeSend()
+					p.conn.Close()
+				}
+			}
+			// Force cleanup any remaining state
+			s.store.Leave(roomName, "__ttl_cleanup__")
+		}
+	}
 }
 
 // cleanupLoop periodically submits room:cleanup jobs to the worker.
@@ -769,6 +822,23 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			"disconnected": len(peerIDs),
 		})
 
+	case "ttl":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ttl, createdAt, exists := s.store.RoomTTL(roomName)
+		var expiresAt int64
+		if exists && ttl > 0 {
+			expiresAt = createdAt.Add(time.Duration(ttl) * time.Second).UnixMilli()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ttlSeconds": ttl,
+			"expiresAt":  expiresAt,
+			"exists":     exists,
+		})
+
 	case "broadcast":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -837,6 +907,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.conns[peerID] = p
 	s.connMu.Unlock()
 
+	// Send welcome message with peer's assigned ID
+	welcomeEnv := protocol.Envelope{
+		Type:      protocol.TypeWelcome,
+		ID:        peerID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if welcomeData, err := json.Marshal(welcomeEnv); err == nil {
+		p.enqueue(welcomeData)
+	}
+
 	// Ping ticker to detect dead connections
 	pingTicker := time.NewTicker(30 * time.Second)
 
@@ -844,6 +924,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		pingTicker.Stop()
 		s.rl.remove(peerID)
 		s.typingRL.remove(peerID)
+		s.signalRL.remove(peerID)
 		s.connMu.Lock()
 		room := s.peerRooms[peerID]
 		delete(s.conns, peerID)
@@ -903,7 +984,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Validate room name for types that require one
-		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia || env.Type == protocol.TypeTyping || env.Type == protocol.TypeReceipt || env.Type == protocol.TypeKeyRotation {
+		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia || env.Type == protocol.TypeTyping || env.Type == protocol.TypeReceipt || env.Type == protocol.TypeKeyRotation || env.Type == protocol.TypeSignal {
 			if reason := validateRoomName(env.Room); reason != "" {
 				s.sendError(p, reason)
 				continue
@@ -912,10 +993,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch env.Type {
 		case protocol.TypeJoin:
-			// Enforce room creation limit to prevent DoS
+			// Pre-check room limit (still slightly racy but JoinWithTTL is atomic for room+TTL)
 			if s.store.Count(env.Room) == 0 && s.store.RoomCount() >= maxRooms {
 				s.sendError(p, "room limit reached — try again later")
 				continue
+			}
+
+			// Parse optional nickname and TTL from join payload
+			var jp protocol.JoinPayload
+			if env.Payload != "" {
+				_ = json.Unmarshal([]byte(env.Payload), &jp)
+			}
+
+			// Determine TTL for atomic join (only allowed values)
+			var ttlForJoin int64
+			allowed := map[int64]bool{ttl15Min: true, ttl1Hour: true, ttl4Hour: true, ttl24Hour: true}
+			if jp.TTLSeconds > 0 && allowed[jp.TTLSeconds] {
+				ttlForJoin = jp.TTLSeconds
 			}
 
 			// Atomically read previous room and update mapping
@@ -929,17 +1023,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				s.broadcastPresence(prevRoom)
 			}
 
-			s.store.Join(env.Room, peerID)
+			// Atomic join + TTL — eliminates TOCTOU race and TTL gap
+			s.store.JoinWithTTL(env.Room, peerID, ttlForJoin)
 
-			// Parse optional nickname from join payload
-			if env.Payload != "" {
-				var jp protocol.JoinPayload
-				if err := json.Unmarshal([]byte(env.Payload), &jp); err == nil {
-					nick := sanitizeNickname(jp.Nickname)
-					if nick != "" {
-						s.store.SetNickname(env.Room, peerID, nick)
-					}
-				}
+			nick := sanitizeNickname(jp.Nickname)
+			if nick != "" {
+				s.store.SetNickname(env.Room, peerID, nick)
 			}
 
 			s.broadcastPresence(env.Room)
@@ -1030,6 +1119,39 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			env.Timestamp = time.Now().UnixMilli()
 			s.broadcast(inRoom, env, peerID)
 			s.forwardToRelay(env)
+
+		case protocol.TypeSignal:
+			s.connMu.RLock()
+			inRoom := s.peerRooms[peerID]
+			s.connMu.RUnlock()
+			if inRoom == "" {
+				s.sendError(p, "must join a room before sending signals")
+				continue
+			}
+			if !s.signalRL.allow(peerID) {
+				continue // silently drop excess signals
+			}
+			if env.To == "" {
+				s.sendError(p, "signal requires target peer")
+				continue
+			}
+			env.Room = inRoom
+			env.ID = peerID
+			env.Timestamp = time.Now().UnixMilli()
+			// Forward directly to target peer — must be in the same room
+			s.connMu.RLock()
+			targetPeer, ok := s.conns[env.To]
+			targetRoom := s.peerRooms[env.To]
+			s.connMu.RUnlock()
+			if ok && targetRoom == inRoom {
+				data, err := json.Marshal(env)
+				if err == nil {
+					targetPeer.enqueue(data)
+				}
+			} else {
+				// Target peer not on this instance — forward to relay for cross-gateway delivery
+				s.forwardToRelay(env)
+			}
 
 		case protocol.TypePresence:
 			// Server-generated only, ignore from clients
@@ -1147,11 +1269,16 @@ func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID str
 func (s *Server) broadcastPresence(room string) {
 	peers := s.store.PeersWithNicknames(room)
 	count := len(peers)
-	payload, err := json.Marshal(protocol.PresencePayload{
+	pp := protocol.PresencePayload{
 		Room:  room,
 		Count: count,
 		Peers: peers,
-	})
+	}
+	if ttl, createdAt, ok := s.store.RoomTTL(room); ok && ttl > 0 {
+		pp.TTLSeconds = ttl
+		pp.ExpiresAt = createdAt.Add(time.Duration(ttl) * time.Second).UnixMilli()
+	}
+	payload, err := json.Marshal(pp)
 	if err != nil {
 		slog.Error("presence marshal error", "error", err)
 		return

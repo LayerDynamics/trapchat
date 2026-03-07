@@ -13,6 +13,8 @@ const (
 	TypeTyping      MessageType = "typing"
 	TypeReceipt     MessageType = "receipt"
 	TypeKeyRotation MessageType = "key_rotation"
+	TypeSignal      MessageType = "signal"
+	TypeWelcome     MessageType = "welcome"
 )
 
 // Envelope is the wire format for all WebSocket messages.
@@ -24,6 +26,7 @@ type Envelope struct {
 	Payload   string      `json:"payload,omitempty"`
 	Timestamp int64       `json:"timestamp"`
 	Sig       string      `json:"sig,omitempty"` // server-side HMAC-SHA256 signature for integrity verification
+	To        string      `json:"to,omitempty"`  // target peerID for signal messages
 }
 
 // ChatPayload is the decrypted inner payload for chat messages.
@@ -34,9 +37,11 @@ type ChatPayload struct {
 
 // PresencePayload reports room occupancy.
 type PresencePayload struct {
-	Room  string            `json:"room"`
-	Count int               `json:"count"`
-	Peers map[string]string `json:"peers,omitempty"` // peerID → nickname
+	Room       string            `json:"room"`
+	Count      int               `json:"count"`
+	Peers      map[string]string `json:"peers,omitempty"` // peerID → nickname
+	TTLSeconds int64             `json:"ttlSeconds,omitempty"`
+	ExpiresAt  int64             `json:"expiresAt,omitempty"` // unix ms
 }
 
 // TypingPayload indicates typing state.
@@ -53,5 +58,6 @@ type ReceiptPayload struct {
 
 // JoinPayload carries optional metadata when joining a room.
 type JoinPayload struct {
-	Nickname string `json:"nickname,omitempty"`
+	Nickname   string `json:"nickname,omitempty"`
+	TTLSeconds int64  `json:"ttlSeconds,omitempty"`
 }

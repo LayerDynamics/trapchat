@@ -446,6 +446,22 @@ h1 {
   background: var(--border-color);
 }
 
+.canvas-clear-btn {
+  height: 40px;
+  padding: 0 0.75em;
+  font-size: 0.8em;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.canvas-clear-btn:hover {
+  background: var(--border-color);
+  color: var(--text-primary);
+}
+
 .attach-btn {
   width: 40px;
   height: 40px;
@@ -462,6 +478,40 @@ h1 {
 
 .attach-btn:hover {
   opacity: 0.8;
+}
+
+/* P2P badge */
+.p2p-badge {
+  background: #22c55e;
+  color: #000;
+  font-size: 0.65em;
+  font-weight: 700;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+/* TTL countdown */
+.ttl-countdown {
+  color: var(--text-secondary);
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* TTL select in join form */
+.ttl-select {
+  flex: 1;
+  padding: 0.75em 1em;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: inherit;
+  font-size: 1em;
+  font-family: inherit;
 }
 
 /* Touch optimizations */

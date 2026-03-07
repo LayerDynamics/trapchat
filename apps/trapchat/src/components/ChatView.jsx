@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 
 const ACCEPTED_FILE_TYPES = 'image/*,video/*,application/pdf'
 
@@ -61,11 +61,23 @@ function useCanvasDrawing(canvasRef) {
   }, [canvasRef, getPos])
 }
 
+function formatTimeRemaining(ms) {
+  if (ms <= 0) return 'expired'
+  const totalSec = Math.floor(ms / 1000)
+  const h = Math.floor(totalSec / 3600)
+  const m = Math.floor((totalSec % 3600) / 60)
+  const s = totalSec % 60
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
 export default function ChatView({
   room,
   status,
   peerCount,
   peerNicknames,
+  expiresAt,
+  p2p,
   messages,
   input,
   onInputChange,
@@ -90,6 +102,25 @@ export default function ChatView({
 }) {
   useCanvasDrawing(canvasRef)
 
+  const [timeRemaining, setTimeRemaining] = useState(null)
+  useEffect(() => {
+    if (!expiresAt) {
+      setTimeRemaining(null)
+      return
+    }
+    const update = () => {
+      const remaining = expiresAt - Date.now()
+      setTimeRemaining(remaining)
+      if (remaining <= 0) {
+        clearInterval(id)
+        onLeave()
+      }
+    }
+    update()
+    const id = setInterval(update, 1000)
+    return () => clearInterval(id)
+  }, [expiresAt, onLeave])
+
   const clearCanvas = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -103,6 +134,8 @@ export default function ChatView({
         <span className={`status-dot ${status === 'connected' ? 'green' : status.startsWith('reconnecting') ? 'yellow' : 'red'}`} aria-label={`Connection status: ${status}`} />
         <span className="room-name">#{room}</span>
         <span className="peer-count" aria-live="polite" title={peerNicknames && Object.values(peerNicknames).filter(Boolean).join(', ')}>{peerCount} online</span>
+        {p2p && <span className="p2p-badge">p2p</span>}
+        {timeRemaining !== null && <span className="ttl-countdown">{formatTimeRemaining(timeRemaining)}</span>}
         <button onClick={onLeave} className="leave-btn" aria-label="Leave room">leave</button>
       </header>
       {shareLink && (

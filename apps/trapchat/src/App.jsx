@@ -5,6 +5,7 @@ import { generateRoomKey, exportKey, importKey, encrypt, deriveRoomKey } from '.
 import { useKeyRotation } from './hooks/useKeyRotation.js'
 import { useTypingIndicator } from './hooks/useTypingIndicator.js'
 import { useMediaTransfer } from './hooks/useMediaTransfer.js'
+import { PeerConnection } from './lib/webrtc.js'
 import JoinView from './components/JoinView.jsx'
 import ChatView from './components/ChatView.jsx'
 import './App.css'
@@ -35,6 +36,11 @@ function App() {
   const bottomRef = useRef(null)
   const unsubsRef = useRef([])
   const clientRef = useRef(null)
+  const [ttl, setTtl] = useState(0)
+  const [expiresAt, setExpiresAt] = useState(null)
+  const [isP2P, setIsP2P] = useState(false)
+  const peerConnectionRef = useRef(null)
+  const prevPeerCountRef = useRef(0)
   const [passphrase, setPassphrase] = useState('')
   const [shareLink, setShareLink] = useState('')
   const [copied, setCopied] = useState(false)
@@ -221,7 +227,9 @@ function App() {
       }, { threshold: 0.5 })
 
       unsubsRef.current.push(client.on('message', async (data) => {
-        if (typeof data === 'object' && data.type === 'presence') {
+        if (typeof data === 'object' && data.type === 'welcome') {
+          // Handled by TrapChatClient internally (stores peerId)
+        } else if (typeof data === 'object' && data.type === 'presence') {
           try {
             const presence = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload
             setPeerCount(presence.count || 0)
@@ -229,8 +237,92 @@ function App() {
               peerNicknamesRef.current = presence.peers
               setPeerNicknames(presence.peers)
             }
+            if (presence.expiresAt) {
+              setExpiresAt(presence.expiresAt)
+            }
+            // WebRTC: initiate P2P when transitioning to exactly 2 peers
+            const count = presence.count || 0
+            const wasNot2 = prevPeerCountRef.current !== 2
+            prevPeerCountRef.current = count
+            if (count === 2 && wasNot2 && !peerConnectionRef.current) {
+              // Tiebreaker: only the peer with the lower ID creates the offer
+              const selfId = client.peerId
+              const pids = peerNicknamesRef.current ? Object.keys(peerNicknamesRef.current) : []
+              const remotePid = pids.find(pid => pid !== selfId)
+              if (selfId && remotePid && selfId < remotePid) {
+                // Delay briefly to let both peers receive presence
+                setTimeout(async () => {
+                  if (peerConnectionRef.current) return
+                  const pc = new PeerConnection(
+                    (signalPayload) => {
+                      // Send only to remote peer, not self
+                      const msg = JSON.stringify({
+                        id: crypto.randomUUID(), type: 'signal', room,
+                        to: remotePid, payload: JSON.stringify(signalPayload), timestamp: Date.now(),
+                      })
+                      if (client.connected) client.sendRaw(msg)
+                    },
+                    (msgData) => {
+                      try { client.emitP2P('message', JSON.parse(msgData)) } catch {}
+                    }
+                  )
+                  pc.onConnected = () => setIsP2P(true)
+                  pc.onDisconnected = () => setIsP2P(false)
+                  peerConnectionRef.current = pc
+                  try {
+                    await pc.createOffer()
+                  } catch (err) {
+                    console.error('WebRTC offer failed:', err)
+                    peerConnectionRef.current = null
+                  }
+                }, 500)
+              }
+            } else if (count !== 2 && peerConnectionRef.current) {
+              peerConnectionRef.current.close()
+              peerConnectionRef.current = null
+              setIsP2P(false)
+            }
           } catch {
             setPeerCount(data.count || 0)
+          }
+        } else if (typeof data === 'object' && data.type === 'signal') {
+          // Handle WebRTC signaling
+          try {
+            const signalData = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload
+            const sendSignalTo = (signalPayload) => {
+              const msg = JSON.stringify({
+                id: crypto.randomUUID(),
+                type: 'signal',
+                room,
+                to: data.id, // respond to sender
+                payload: JSON.stringify(signalPayload),
+                timestamp: Date.now(),
+              })
+              if (client.connected) {
+                client.sendRaw(msg)
+              }
+            }
+            if (signalData.signalType === 'offer') {
+              if (peerConnectionRef.current) {
+                peerConnectionRef.current.close()
+              }
+              const pc = new PeerConnection(
+                sendSignalTo,
+                (msgData) => {
+                  try { client.emitP2P('message', JSON.parse(msgData)) } catch {}
+                }
+              )
+              pc.onConnected = () => setIsP2P(true)
+              pc.onDisconnected = () => setIsP2P(false)
+              peerConnectionRef.current = pc
+              await pc.handleOffer(signalData.data)
+            } else if (signalData.signalType === 'answer' && peerConnectionRef.current) {
+              await peerConnectionRef.current.handleAnswer(signalData.data)
+            } else if (signalData.signalType === 'ice' && peerConnectionRef.current) {
+              await peerConnectionRef.current.handleIceCandidate(signalData.data)
+            }
+          } catch (err) {
+            console.error('WebRTC signal handling error:', err)
           }
         } else if (typeof data === 'object' && data.type === 'typing') {
           handleTypingMessage(data)
@@ -292,14 +384,45 @@ function App() {
         setStatus('connected')
       }))
 
-      const joinPayload = nickname.trim() ? JSON.stringify({ nickname: nickname.trim() }) : null
+      // Handle P2P data channel messages (only chat and media — not presence/key_rotation)
+      unsubsRef.current.push(client.on('p2p:message', async (data) => {
+        if (typeof data !== 'object') return
+        if (data.type === 'chat') {
+          let text
+          try {
+            text = await decryptWithRotation(data.payload)
+            if (text.length > MAX_TEXT_LENGTH) {
+              text = text.slice(0, MAX_TEXT_LENGTH) + '... [truncated]'
+            }
+          } catch {
+            text = '[encrypted message — key mismatch]'
+          }
+          const msgId = data.msgId || crypto.randomUUID()
+          appendMessage({
+            id: msgId,
+            text,
+            time: new Date().toLocaleTimeString(),
+            error: text === '[encrypted message — key mismatch]',
+            senderId: data.id,
+            senderNickname: peerNicknamesRef.current[data.id] || (data.id ? data.id.slice(0, 8) : ''),
+            p2p: true,
+          })
+        } else if (data.type === 'media') {
+          handleMediaChunk(data)
+        }
+      }))
+
+      const jpObj = {}
+      if (nickname.trim()) jpObj.nickname = nickname.trim()
+      if (ttl > 0) jpObj.ttlSeconds = ttl
+      const joinPayload = Object.keys(jpObj).length > 0 ? JSON.stringify(jpObj) : null
       client.send('join', room, joinPayload)
       setView('chat')
     } catch (err) {
       setStatus('error')
       console.error('connection failed:', err)
     }
-  }, [room, passphrase, nickname, appendMessage, startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation])
+  }, [room, passphrase, nickname, ttl, appendMessage, startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation])
 
   const sendMessage = useCallback(async (e) => {
     e.preventDefault()
@@ -323,7 +446,21 @@ function App() {
       return
     }
     const msgId = crypto.randomUUID()
-    const sent = client.send('chat', room, encrypted, { msgId })
+    // Try P2P data channel first, fall back to WS relay
+    let sent = false
+    if (peerConnectionRef.current?.connected) {
+      try {
+        const p2pMsg = JSON.stringify({
+          id: crypto.randomUUID(), msgId, type: 'chat', room, payload: encrypted, timestamp: Date.now(),
+        })
+        sent = peerConnectionRef.current.send(p2pMsg)
+      } catch {
+        sent = false
+      }
+    }
+    if (!sent) {
+      sent = client.send('chat', room, encrypted, { msgId })
+    }
 
     appendMessage({
       id: msgId,
@@ -348,11 +485,19 @@ function App() {
       observerRef.current.disconnect()
       observerRef.current = null
     }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close()
+      peerConnectionRef.current = null
+    }
+    setIsP2P(false)
+    prevPeerCountRef.current = 0
     clearTyping()
     setView('join')
     setMessages([])
     setRoom('')
     setNickname('')
+    setTtl(0)
+    setExpiresAt(null)
     peerNicknamesRef.current = {}
     setPeerNicknames({})
     setMessageReceipts({})
@@ -368,6 +513,7 @@ function App() {
         room={room} setRoom={setRoom}
         nickname={nickname} setNickname={setNickname}
         passphrase={passphrase} setPassphrase={setPassphrase}
+        ttl={ttl} setTtl={setTtl}
         onJoin={joinRoom} status={status}
       />
     )
@@ -376,6 +522,7 @@ function App() {
   return (
     <ChatView
       room={room} status={status} peerCount={peerCount} peerNicknames={peerNicknames}
+      expiresAt={expiresAt} p2p={isP2P}
       messages={messages} input={input}
       onInputChange={handleInputChange} onSend={sendMessage} onLeave={leaveRoom}
       shareLink={shareLink} copied={copied} onCopyShareLink={copyShareLink}
