@@ -12,12 +12,14 @@ function checkAuth(req, res) {
   if (!AUTH_TOKEN) return true; // no auth configured — dev mode
   const header = req.headers['authorization'] || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!token || token.length !== AUTH_TOKEN.length) {
+  const tokenBuf = Buffer.from(token);
+  const authBuf = Buffer.from(AUTH_TOKEN);
+  if (!token || tokenBuf.length !== authBuf.length) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return false;
   }
-  if (!timingSafeEqual(Buffer.from(token), Buffer.from(AUTH_TOKEN))) {
+  if (!timingSafeEqual(tokenBuf, authBuf)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return false;
