@@ -9,9 +9,18 @@ const MAX_MESSAGES = 500
 const MAX_ROOM_NAME_LEN = 64
 const ACCEPTED_FILE_TYPES = 'image/*,video/*,application/pdf'
 
+const KEY_ROTATION_INTERVAL = parseInt(import.meta.env.VITE_KEY_ROTATION_INTERVAL || '1800000', 10)
+
 function App() {
   const [view, setView] = useState('join')
-  const [room, setRoom] = useState('')
+  const [room, setRoom] = useState(() => {
+    const hash = window.location.hash.slice(1)
+    if (hash.includes('/')) {
+      const [roomName] = hash.split('/', 2)
+      if (roomName) return decodeURIComponent(roomName)
+    }
+    return ''
+  })
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [peerCount, setPeerCount] = useState(0)
@@ -34,33 +43,25 @@ function App() {
   // Track whether disconnect was intentional to avoid conflicting with reconnect
   const intentionalDisconnectRef = useRef(false)
 
-  // Key rotation interval from env or default 30 minutes
-  const KEY_ROTATION_INTERVAL = parseInt(import.meta.env.VITE_KEY_ROTATION_INTERVAL || '1800000', 10)
+
 
   // Generate QR code data URL when share link changes
   useEffect(() => {
-    let cancelled = false
+    if (!shareLink) return
 
-    if (shareLink) {
-      QRCode.toDataURL(shareLink, { width: 200, margin: 2 })
-        .then((url) => {
-          if (!cancelled) {
-            setQrDataURL(url)
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setQrDataURL('')
-          }
-        })
-    } else {
-      // Synchronous reset is intentional — clearing derived state when source is empty
-      setQrDataURL('') // eslint-disable-line react-hooks/set-state-in-effect
-      setShowQR(false) // eslint-disable-line react-hooks/set-state-in-effect
-    }
+    let cancelled = false
+    QRCode.toDataURL(shareLink, { width: 200, margin: 2 })
+      .then((url) => {
+        if (!cancelled) setQrDataURL(url)
+      })
+      .catch(() => {
+        if (!cancelled) setQrDataURL('')
+      })
 
     return () => {
       cancelled = true
+      setQrDataURL('')
+      setShowQR(false)
     }
   }, [shareLink])
 
@@ -118,14 +119,12 @@ function App() {
     }
   }, [])
 
-  // Check URL fragment for room#key on mount
+  // Check URL fragment for key on mount (room is initialized via useState)
   useEffect(() => {
     const hash = window.location.hash.slice(1)
     if (hash.includes('/')) {
       const [roomName, keyFragment] = hash.split('/', 2)
       if (roomName && keyFragment) {
-        setRoom(decodeURIComponent(roomName)) // eslint-disable-line react-hooks/set-state-in-effect
-        // Store the fragment key to be used during join
         keyRef.current = keyFragment
       }
     }

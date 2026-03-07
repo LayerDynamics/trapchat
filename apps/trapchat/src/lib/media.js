@@ -19,7 +19,7 @@ const MAGIC_BYTES = {
 function sanitizeFileName(name) {
   if (!name || typeof name !== 'string') return 'file';
   // Strip path separators and null bytes to prevent path traversal
-  return name.replace(/[\/\\:\x00]/g, '_').slice(0, 255);
+  return name.replace(/[/\\:\0]/g, '_').slice(0, 255);
 }
 
 function detectMimeType(file, bytes) {
