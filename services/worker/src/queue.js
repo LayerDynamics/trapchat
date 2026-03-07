@@ -41,7 +41,35 @@ export class Queue {
   }
 
   failed(job) {
-    this.#deadLetters.push({ ...job, failedAt: Date.now() });
+    // Only retain minimal, non-sensitive metadata for dead letters
+    const {
+      id,
+      type,
+      attempts,
+      maxAttempts,
+      error,
+      lastError,
+      queuedAt,
+      scheduledAt,
+    } = job;
+
+    const errorSummary =
+      (error && typeof error === 'object' && 'message' in error && error.message) ||
+      (lastError && typeof lastError === 'object' && 'message' in lastError && lastError.message) ||
+      (typeof error === 'string' ? error : undefined) ||
+      (typeof lastError === 'string' ? lastError : undefined);
+
+    this.#deadLetters.push({
+      id,
+      type,
+      attempts,
+      maxAttempts,
+      queuedAt,
+      scheduledAt,
+      failedAt: Date.now(),
+      error: errorSummary,
+    });
+
     // Evict oldest dead letters to prevent unbounded memory growth
     while (this.#deadLetters.length > MAX_DEAD_LETTERS) {
       this.#deadLetters.shift();
