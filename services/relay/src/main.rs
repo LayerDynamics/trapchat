@@ -307,9 +307,9 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                                     room: room_name.clone(),
                                 };
                                 if let Ok(frame) = frame_event(&event) {
-                            info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(),
-                                serde_json::to_string(&event).unwrap_or_default());
-                        }
+                                    info!("event frame_type={} len={} {}", frame.frame_type, frame.payload.len(), String::from_utf8_lossy(&frame.payload));
+                                }
+
                             }
                             room_arc
                         };
