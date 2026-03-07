@@ -43,8 +43,9 @@ function App() {
           }
         })
     } else {
-      setQrDataURL('')
-      setShowQR(false)
+      // Synchronous reset is intentional — clearing derived state when source is empty
+      setQrDataURL('') // eslint-disable-line react-hooks/set-state-in-effect
+      setShowQR(false) // eslint-disable-line react-hooks/set-state-in-effect
     }
 
     return () => {
@@ -108,7 +109,7 @@ function App() {
     if (hash.includes('/')) {
       const [roomName, keyFragment] = hash.split('/', 2)
       if (roomName && keyFragment) {
-        setRoom(decodeURIComponent(roomName))
+        setRoom(decodeURIComponent(roomName)) // eslint-disable-line react-hooks/set-state-in-effect
         // Store the fragment key to be used during join
         keyRef.current = keyFragment
       }
