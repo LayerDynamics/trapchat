@@ -3,6 +3,9 @@ package protocol
 // MessageType represents the set of valid envelope types.
 type MessageType string
 
+// MaxRooms is the maximum number of rooms a single peer can join simultaneously.
+const MaxRooms = 5
+
 const (
 	TypeJoin     MessageType = "join"
 	TypeLeave    MessageType = "leave"
@@ -15,6 +18,10 @@ const (
 	TypeKeyRotation MessageType = "key_rotation"
 	TypeSignal      MessageType = "signal"
 	TypeWelcome     MessageType = "welcome"
+	TypeRoomList    MessageType = "room_list"
+	TypeCallOffer   MessageType = "call_offer"
+	TypeCallAnswer  MessageType = "call_answer"
+	TypeCallEnd     MessageType = "call_end"
 )
 
 // Envelope is the wire format for all WebSocket messages.
