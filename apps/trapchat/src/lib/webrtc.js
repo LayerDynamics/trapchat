@@ -15,6 +15,8 @@ export class PeerConnection {
   onConnected = null
   /** @type {(() => void)|null} */
   onDisconnected = null
+  /** @type {((stream: MediaStream) => void)|null} */
+  onTrack = null
 
   /**
    * @param {(signal: object) => void} sendSignal — sends signaling data via WS
@@ -32,9 +34,21 @@ export class PeerConnection {
   async createOffer() {
     this.#pc = new RTCPeerConnection(RTC_CONFIG)
     this.#setupIceHandling()
+    this.#setupTrackHandling()
 
     this.#dc = this.#pc.createDataChannel('trapchat', { ordered: true })
     this.#setupDataChannel(this.#dc)
+
+    // Auto-renegotiate when tracks are added/removed
+    this.#pc.onnegotiationneeded = async () => {
+      try {
+        const offer = await this.#pc.createOffer()
+        await this.#pc.setLocalDescription(offer)
+        this.#sendSignal({ signalType: 'offer', data: this.#pc.localDescription })
+      } catch (err) {
+        console.error('Renegotiation failed:', err)
+      }
+    }
 
     const offer = await this.#pc.createOffer()
     await this.#pc.setLocalDescription(offer)
@@ -42,12 +56,25 @@ export class PeerConnection {
   }
 
   async handleOffer(sdp) {
-    this.#pc = new RTCPeerConnection(RTC_CONFIG)
-    this.#setupIceHandling()
+    if (!this.#pc) {
+      this.#pc = new RTCPeerConnection(RTC_CONFIG)
+      this.#setupIceHandling()
+      this.#setupTrackHandling()
 
-    this.#pc.ondatachannel = (event) => {
-      this.#dc = event.channel
-      this.#setupDataChannel(this.#dc)
+      this.#pc.ondatachannel = (event) => {
+        this.#dc = event.channel
+        this.#setupDataChannel(this.#dc)
+      }
+
+      this.#pc.onnegotiationneeded = async () => {
+        try {
+          const offer = await this.#pc.createOffer()
+          await this.#pc.setLocalDescription(offer)
+          this.#sendSignal({ signalType: 'offer', data: this.#pc.localDescription })
+        } catch (err) {
+          console.error('Renegotiation failed:', err)
+        }
+      }
     }
 
     await this.#pc.setRemoteDescription(new RTCSessionDescription(sdp))
@@ -80,6 +107,29 @@ export class PeerConnection {
       await this.#pc.addIceCandidate(new RTCIceCandidate(candidate))
     }
     this.#pendingCandidates = []
+  }
+
+  /**
+   * Add a local media stream (audio/video) to the peer connection.
+   * @param {MediaStream} stream
+   */
+  async addLocalStream(stream) {
+    if (!this.#pc) return
+    for (const track of stream.getTracks()) {
+      this.#pc.addTrack(track, stream)
+    }
+  }
+
+  /**
+   * Remove all media senders (stops sending audio/video).
+   */
+  removeLocalStream() {
+    if (!this.#pc) return
+    for (const sender of this.#pc.getSenders()) {
+      if (sender.track) {
+        this.#pc.removeTrack(sender)
+      }
+    }
   }
 
   /**
@@ -120,6 +170,14 @@ export class PeerConnection {
     }
   }
 
+  #setupTrackHandling() {
+    this.#pc.ontrack = (event) => {
+      if (event.streams?.[0]) {
+        this.onTrack?.(event.streams[0])
+      }
+    }
+  }
+
   #setupDataChannel(dc) {
     dc.onopen = () => {
       this.#connected = true
@@ -132,5 +190,129 @@ export class PeerConnection {
     dc.onmessage = (event) => {
       this.#onMessage(event.data)
     }
+  }
+}
+
+/**
+ * PeerMesh manages a full mesh of PeerConnections for multi-peer rooms.
+ * Each pair of peers gets its own PeerConnection for data channels and media streams.
+ * Max 4 peers for voice/video (mesh scales poorly beyond that).
+ */
+export class PeerMesh {
+  #connections = new Map() // peerId -> PeerConnection
+  #onPeerMessage
+  #onPeerConnected
+  #onPeerDisconnected
+  #onPeerTrack
+
+  /**
+   * @param {object} opts
+   * @param {(peerId: string, data: string) => void} opts.onMessage
+   * @param {(peerId: string) => void} opts.onConnected
+   * @param {(peerId: string) => void} opts.onDisconnected
+   * @param {(peerId: string, stream: MediaStream) => void} opts.onTrack
+   */
+  constructor({ onMessage, onConnected, onDisconnected, onTrack }) {
+    this.#onPeerMessage = onMessage
+    this.#onPeerConnected = onConnected
+    this.#onPeerDisconnected = onDisconnected
+    this.#onPeerTrack = onTrack
+  }
+
+  /**
+   * Add a peer to the mesh.
+   * @param {string} peerId
+   * @param {(signal: object) => void} sendSignal
+   * @param {boolean} isInitiator — if true, creates offer immediately
+   */
+  async addPeer(peerId, sendSignal, isInitiator) {
+    if (this.#connections.has(peerId)) return
+
+    const pc = new PeerConnection(
+      sendSignal,
+      (data) => this.#onPeerMessage?.(peerId, data)
+    )
+    pc.onConnected = () => this.#onPeerConnected?.(peerId)
+    pc.onDisconnected = () => this.#onPeerDisconnected?.(peerId)
+    pc.onTrack = (stream) => this.#onPeerTrack?.(peerId, stream)
+
+    this.#connections.set(peerId, pc)
+
+    if (isInitiator) {
+      await pc.createOffer()
+    }
+  }
+
+  /**
+   * Remove a peer from the mesh.
+   * @param {string} peerId
+   */
+  removePeer(peerId) {
+    const pc = this.#connections.get(peerId)
+    if (pc) {
+      pc.close()
+      this.#connections.delete(peerId)
+    }
+  }
+
+  /**
+   * Route a signaling message to the correct PeerConnection.
+   * @param {string} fromPeerId
+   * @param {object} signal — { signalType, data }
+   */
+  async handleSignal(fromPeerId, signal) {
+    let pc = this.#connections.get(fromPeerId)
+    if (!pc && signal.signalType === 'offer') {
+      // Lazily create connection for incoming offers
+      // The sendSignal will be set up by the consumer via addPeer
+      return // consumer should call addPeer first then re-handle
+    }
+    if (!pc) return
+
+    if (signal.signalType === 'offer') {
+      await pc.handleOffer(signal.data)
+    } else if (signal.signalType === 'answer') {
+      await pc.handleAnswer(signal.data)
+    } else if (signal.signalType === 'ice') {
+      await pc.handleIceCandidate(signal.data)
+    }
+  }
+
+  /**
+   * Add a media stream to all peer connections in the mesh.
+   * @param {MediaStream} stream
+   */
+  async broadcastStream(stream) {
+    for (const pc of this.#connections.values()) {
+      await pc.addLocalStream(stream)
+    }
+  }
+
+  /**
+   * Remove media streams from all peer connections.
+   */
+  removeAllStreams() {
+    for (const pc of this.#connections.values()) {
+      pc.removeLocalStream()
+    }
+  }
+
+  get connectedPeers() {
+    const peers = []
+    for (const [id, pc] of this.#connections) {
+      if (pc.connected) peers.push(id)
+    }
+    return peers
+  }
+
+  getConnection(peerId) {
+    return this.#connections.get(peerId)
+  }
+
+  closeAll() {
+    for (const pc of this.#connections.values()) {
+      pc.close()
+    }
+    this.#connections.clear()
   }
 }
