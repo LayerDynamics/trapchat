@@ -1,6 +1,7 @@
 const MAX_RECONNECT_DELAY = 30000;
 const BASE_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_ATTEMPTS = 20;
+const MAX_ROOMS = 5;
 
 export class TrapChatClient {
   #ws = null;
@@ -9,8 +10,8 @@ export class TrapChatClient {
   #reconnecting = false;
   #reconnectAttempts = 0;
   #reconnectTimer = null;
-  #lastRoom = null;
-  #pendingQueue = [];
+  #joinedRooms = new Map(); // room -> join payload (for rejoin on reconnect)
+  #pendingQueue = []; // { room, msg } tagged with room
   #peerId = null;
 
   constructor(url) {
@@ -24,9 +25,11 @@ export class TrapChatClient {
       this.#ws.onopen = () => {
         this.#reconnectAttempts = 0;
         this.#emit('open');
-        // Rejoin room after reconnect
-        if (this.#reconnecting && this.#lastRoom) {
-          this.send('join', this.#lastRoom, null);
+        // Rejoin all rooms after reconnect
+        if (this.#reconnecting && this.#joinedRooms.size > 0) {
+          for (const [room, payload] of this.#joinedRooms) {
+            this.send('join', room, payload);
+          }
           this.#reconnecting = false;
         }
         // Flush any messages queued while disconnected
@@ -63,7 +66,7 @@ export class TrapChatClient {
 
   disconnect() {
     this.#clearReconnect();
-    this.#lastRoom = null;
+    this.#joinedRooms.clear();
     this.#pendingQueue = [];
     if (this.#ws) {
       this.#ws.close();
@@ -77,9 +80,9 @@ export class TrapChatClient {
    */
   send(type, room, payload, { msgId } = {}) {
     if (type === 'join') {
-      this.#lastRoom = room;
+      this.#joinedRooms.set(room, payload);
     } else if (type === 'leave') {
-      this.#lastRoom = null;
+      this.#joinedRooms.delete(room);
     }
 
     const msg = JSON.stringify({ id: crypto.randomUUID(), msgId: msgId || crypto.randomUUID(), type, room, payload, timestamp: Date.now() });
@@ -88,7 +91,7 @@ export class TrapChatClient {
       // Queue chat/media messages for delivery after reconnect
       if (type === 'chat' || type === 'media') {
         if (this.#pendingQueue.length < 200) {
-          this.#pendingQueue.push(msg);
+          this.#pendingQueue.push({ room, msg });
         }
         this.#emit('queued', { type, room });
       }
@@ -114,7 +117,7 @@ export class TrapChatClient {
 
   #flushQueue() {
     while (this.#pendingQueue.length > 0) {
-      const msg = this.#pendingQueue.shift();
+      const { msg } = this.#pendingQueue.shift();
       if (this.#ws && this.#ws.readyState === WebSocket.OPEN) {
         this.#ws.send(msg);
       }
@@ -122,7 +125,7 @@ export class TrapChatClient {
   }
 
   #attemptReconnect() {
-    if (!this.#lastRoom) return; // Only reconnect if user was in a room
+    if (this.#joinedRooms.size === 0) return; // Only reconnect if user was in a room
     if (this.#reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this.#emit('reconnect_failed', { attempts: this.#reconnectAttempts });
       this.#reconnecting = false;
@@ -180,5 +183,10 @@ export class TrapChatClient {
 
   get connected() {
     return this.#ws?.readyState === WebSocket.OPEN;
+  }
+
+  /** Set of currently joined room names. */
+  get joinedRooms() {
+    return new Set(this.#joinedRooms.keys());
   }
 }
