@@ -254,7 +254,7 @@ function App() {
       setStatus(`error: ${err.message || err}`)
       console.error('connection failed:', err)
     }
-  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState, setupRoomKey, setStatus, setActiveRoom, setView, activeRoomRef, MAX_ROOM_NAME_LEN, MAX_ROOMS])
+  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState, setupRoomKey, setStatus, setActiveRoom, setView, activeRoomRef, saltRefs, MAX_ROOM_NAME_LEN, MAX_ROOMS])
 
   const setupGlobalHandlers = useCallback((client) => {
     unsubsRef.current.forEach(fn => fn())
@@ -471,7 +471,7 @@ function App() {
         handleMediaChunk(data)
       }
     }))
-  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, handlePresenceMesh, handleWebRTCSignal, setRooms, setStatus, activeRoomRef, keyRefs, roomsRef, MAX_TEXT_LENGTH])
+  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, handlePresenceMesh, handleWebRTCSignal, setRooms, setStatus, activeRoomRef, activeKeyRef, keyRefs, roomsRef, saltRefs, passphraseRefs, MAX_TEXT_LENGTH])
 
   useEffect(() => { setupGlobalHandlersRef.current = setupGlobalHandlers }, [setupGlobalHandlers])
 
