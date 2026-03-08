@@ -42,6 +42,9 @@ impl Frame {
         }
 
         let frame_type = data[0];
+        if frame_type == 0 {
+            return Err(IoError::InvalidFrameType(frame_type));
+        }
         let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
 
         if length > MAX_FRAME_SIZE {

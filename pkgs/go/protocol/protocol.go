@@ -49,6 +49,7 @@ type PresencePayload struct {
 	Peers      map[string]string `json:"peers,omitempty"` // peerID → nickname
 	TTLSeconds int64             `json:"ttlSeconds,omitempty"`
 	ExpiresAt  int64             `json:"expiresAt,omitempty"` // unix ms
+	Salt       string            `json:"salt,omitempty"`
 }
 
 // TypingPayload indicates typing state.
@@ -67,4 +68,5 @@ type ReceiptPayload struct {
 type JoinPayload struct {
 	Nickname   string `json:"nickname,omitempty"`
 	TTLSeconds int64  `json:"ttlSeconds,omitempty"`
+	Salt       string `json:"salt,omitempty"`
 }

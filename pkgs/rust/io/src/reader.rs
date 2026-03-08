@@ -25,6 +25,10 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
         self.reader.read_exact(&mut header).await?;
 
         let frame_type = header[0];
+        if frame_type == 0 {
+            warn!("invalid frame type: {}", frame_type);
+            return Err(IoError::InvalidFrameType(frame_type));
+        }
         let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
         debug!("reading frame type={} length={}", frame_type, length);
@@ -40,13 +44,29 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
         self.buf.resize(length, 0);
         self.reader.read_exact(&mut self.buf[..length]).await?;
 
-        Ok(Frame::new(frame_type, self.buf[..length].to_vec()))
+        let payload = self.buf[..length].to_vec();
+
+        // Shrink buffer back if a large frame inflated it beyond the default
+        const SHRINK_THRESHOLD: usize = 64 * 1024;
+        if self.buf.capacity() > SHRINK_THRESHOLD && length <= 4096 {
+            self.buf = Vec::with_capacity(4096);
+        }
+
+        Ok(Frame::new(frame_type, payload))
     }
 
+    /// Maximum number of frames `read_all` will collect before stopping.
+    const MAX_READ_ALL_FRAMES: usize = 10_000;
+
     /// Read all available frames into a Vec, consuming the reader.
+    /// Stops after `MAX_READ_ALL_FRAMES` to prevent unbounded memory growth.
     pub async fn read_all(mut self) -> Vec<Result<Frame, IoError>> {
         let mut frames = Vec::new();
         loop {
+            if frames.len() >= Self::MAX_READ_ALL_FRAMES {
+                warn!("read_all hit frame limit ({}), stopping", Self::MAX_READ_ALL_FRAMES);
+                break;
+            }
             match self.read_frame().await {
                 Ok(frame) => frames.push(Ok(frame)),
                 Err(IoError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,

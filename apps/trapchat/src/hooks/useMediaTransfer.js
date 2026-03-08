@@ -28,6 +28,7 @@ export function useMediaTransfer({ clientRef, keyRef, room, appendMessage }) {
   }, [])
 
   const handleMediaChunk = useCallback(async (data) => {
+    if (!assemblerRef.current) return
     const result = await assemblerRef.current.handleChunk(data, keyRef.current)
     if (!result) return
     if (result.error) {

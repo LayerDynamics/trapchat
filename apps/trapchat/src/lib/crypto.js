@@ -1,8 +1,10 @@
 const ALGO = 'AES-GCM';
 const KEY_LENGTH = 256;
 const IV_LENGTH = 12;
+const PBKDF2_ITERATIONS = 600000;
+const KDF_CONTEXT = 'trapchat:pbkdf2:v1';
 
-function uint8ToBase64(bytes) {
+export function uint8ToBase64(bytes) {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -10,7 +12,7 @@ function uint8ToBase64(bytes) {
   return btoa(binary);
 }
 
-function base64ToUint8(base64) {
+export function base64ToUint8(base64) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -55,9 +57,12 @@ export async function decrypt(key, encoded) {
   return new TextDecoder().decode(plaintext);
 }
 
-export async function deriveRoomKey(roomName, passphrase) {
+export async function deriveRoomKey(roomName, passphrase, salt) {
   if (!passphrase) {
     throw new Error('deriveRoomKey requires a passphrase — room name alone is not secret');
+  }
+  if (!(salt instanceof Uint8Array) || salt.length !== 32) {
+    throw new Error('deriveRoomKey requires a 32-byte Uint8Array salt');
   }
   const enc = new TextEncoder();
   const material = `${roomName}:${passphrase}`;
@@ -68,16 +73,18 @@ export async function deriveRoomKey(roomName, passphrase) {
     false,
     ['deriveKey']
   );
-  // Per-room salt prevents cross-room precomputation attacks.
-  // SHA-256 the room name into a fixed-length, unique salt.
-  const roomBytes = enc.encode(roomName);
-  const saltHash = await crypto.subtle.digest('SHA-256', roomBytes);
-  const salt = new Uint8Array(saltHash);
+  // Combined salt: random salt (32 bytes) || SHA-256(pepper + roomName) (32 bytes)
+  const saltInput = enc.encode(`${KDF_CONTEXT}:${roomName}`);
+  const saltHash = await crypto.subtle.digest('SHA-256', saltInput);
+  const roomHash = new Uint8Array(saltHash);
+  const combinedSalt = new Uint8Array(64);
+  combinedSalt.set(salt, 0);
+  combinedSalt.set(roomHash, 32);
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt,
-      iterations: 100000,
+      salt: combinedSalt,
+      iterations: PBKDF2_ITERATIONS,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -112,6 +119,24 @@ export async function decryptBytes(key, encoded) {
   return new Uint8Array(plaintext);
 }
 
+export async function encryptMediaEnvelope(key, chunkData, metadata) {
+  const envelope = JSON.stringify({
+    ...metadata,
+    data: uint8ToBase64(chunkData),
+  });
+  return encrypt(key, envelope);
+}
+
+export async function decryptMediaEnvelope(key, ciphertext) {
+  const json = await decrypt(key, ciphertext);
+  const parsed = JSON.parse(json);
+  const { data, ...metadata } = parsed;
+  if (typeof data !== 'string') {
+    throw new Error('decryptMediaEnvelope: missing or invalid data field');
+  }
+  return { chunkData: base64ToUint8(data), metadata };
+}
+
 export async function exportKey(key) {
   const raw = await crypto.subtle.exportKey('raw', key);
   return uint8ToBase64(new Uint8Array(raw));
@@ -132,6 +157,7 @@ export class KeyRotator {
   #currentKey = null;
   #previousKey = null;
   #timer = null;
+  #graceTimer = null;
   #onRotate = null;
   #interval;
 
@@ -148,6 +174,7 @@ export class KeyRotator {
 
   /** Start rotation with an initial key */
   start(key) {
+    this.stop();  // Clear any existing timer to prevent leaks
     this.#currentKey = key;
     this.#timer = setInterval(() => this.#rotate(), this.#interval);
   }
@@ -156,6 +183,10 @@ export class KeyRotator {
     if (this.#timer) {
       clearInterval(this.#timer);
       this.#timer = null;
+    }
+    if (this.#graceTimer) {
+      clearTimeout(this.#graceTimer);
+      this.#graceTimer = null;
     }
   }
 
@@ -169,11 +200,13 @@ export class KeyRotator {
 
   /** Accept a rotated key received from a peer's broadcast (does not trigger onRotate) */
   acceptKey(key) {
+    if (this.#graceTimer) clearTimeout(this.#graceTimer);
     this.#previousKey = this.#currentKey;
     this.#currentKey = key;
     // Clear previous key after grace period
-    setTimeout(() => {
+    this.#graceTimer = setTimeout(() => {
       this.#previousKey = null;
+      this.#graceTimer = null;
     }, 30000);
   }
 
@@ -186,8 +219,10 @@ export class KeyRotator {
       this.#onRotate(this.#currentKey, exported, oldKey);
     }
     // Clear previous key after 30s grace period for in-flight messages
-    setTimeout(() => {
+    if (this.#graceTimer) clearTimeout(this.#graceTimer);
+    this.#graceTimer = setTimeout(() => {
       this.#previousKey = null;
+      this.#graceTimer = null;
     }, 30000);
   }
 

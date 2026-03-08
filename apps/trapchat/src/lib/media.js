@@ -1,4 +1,4 @@
-import { encryptBytes, decryptBytes } from './crypto.js';
+import { encryptMediaEnvelope, decryptMediaEnvelope } from './crypto.js';
 
 const CHUNK_SIZE = 512 * 1024; // 512KB raw
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
@@ -60,7 +60,16 @@ function validateMimeType(claimedMime, bytes) {
     return 'video/mp4';
   }
 
-  // No magic bytes matched — use octet-stream for safety instead of trusting claimed type
+  // No magic bytes matched — trust claimed type only for formats that lack magic bytes
+  const SAFE_NO_MAGIC = [
+    'text/', 'application/json', 'application/xml', 'image/svg+xml',
+    'application/javascript', 'application/x-yaml', 'application/toml',
+  ];
+  if (SAFE_NO_MAGIC.some(prefix => claimedMime.startsWith(prefix))) {
+    return claimedMime;
+  }
+
+  // Claimed a binary type (image/png, etc.) but magic bytes didn't match — reject
   return 'application/octet-stream';
 }
 
@@ -79,15 +88,14 @@ export async function sendMedia(client, key, room, file, onProgress) {
     const start = seq * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, bytes.length);
     const chunkData = bytes.slice(start, end);
-    const encryptedChunk = await encryptBytes(key, chunkData);
+    // Only embed metadata in chunk 0 to avoid redundant encryption overhead
+    const metadata = seq === 0 ? { mimeType, fileName: file.name, fileSize: file.size } : {};
+    const encryptedChunk = await encryptMediaEnvelope(key, chunkData, metadata);
 
     const payload = JSON.stringify({
       transferId,
       seq,
       total,
-      mimeType,
-      fileName: file.name,
-      fileSize: file.size,
       chunk: encryptedChunk,
     });
 
@@ -143,7 +151,7 @@ export class MediaAssembler {
       return null;
     }
 
-    const { transferId, seq, total, mimeType, fileName, fileSize, chunk } = meta;
+    const { transferId, seq, total, chunk } = meta;
     if (!transferId || seq === undefined || !total || !chunk) return null;
 
     // Bounds checks to prevent memory abuse
@@ -156,9 +164,9 @@ export class MediaAssembler {
         chunks: new Array(total),
         received: 0,
         total,
-        mimeType,
-        fileName: sanitizeFileName(fileName),
-        fileSize,
+        mimeType: null,
+        fileName: null,
+        fileSize: null,
       });
     }
 
@@ -176,10 +184,20 @@ export class MediaAssembler {
     if (transfer.chunks[seq]) return null; // duplicate
 
     let decrypted;
+    let chunkMeta;
     try {
-      decrypted = await decryptBytes(key, chunk);
+      const result = await decryptMediaEnvelope(key, chunk);
+      decrypted = result.chunkData;
+      chunkMeta = result.metadata;
     } catch {
       return { error: true, transferId, message: '[encrypted media — key mismatch]' };
+    }
+
+    // Store metadata from the first chunk that contains it (handles out-of-order delivery)
+    if (transfer.mimeType === null && chunkMeta.mimeType) {
+      transfer.mimeType = chunkMeta.mimeType;
+      transfer.fileName = sanitizeFileName(chunkMeta.fileName);
+      transfer.fileSize = chunkMeta.fileSize;
     }
 
     transfer.chunks[seq] = decrypted;

@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import JoinView from './JoinView.jsx'
+import AudioVisualizer from './AudioVisualizer.jsx'
 
 const ACCEPTED_FILE_TYPES = 'image/*,video/*,application/pdf'
 
@@ -118,8 +119,10 @@ export default function ChatView({
   callMuted,
   callVideoOff,
   localVideoRef,
+  localStream,
 }) {
   useCanvasDrawing(canvasRef)
+  const observedElsRef = useRef(new Set())
 
   const [timeRemaining, setTimeRemaining] = useState(null)
   useEffect(() => {
@@ -140,6 +143,8 @@ export default function ChatView({
     const id = setInterval(update, 1000)
     return () => clearInterval(id)
   }, [expiresAt, onLeave])
+
+  const [canvasVisible, setCanvasVisible] = useState(false)
 
   const clearCanvas = useCallback(() => {
     const canvas = canvasRef.current
@@ -200,30 +205,42 @@ export default function ChatView({
                 autoPlay
                 playsInline
                 className="remote-video"
-                ref={el => { if (el) el.srcObject = stream }}
+                ref={el => { el ? el.srcObject = stream : null }}
               />
             ))}
             {remoteStreams.size === 0 && (
               <div className="call-waiting">waiting for others to join...</div>
             )}
           </div>
-          <div className="call-controls">
-            <button
-              onClick={onToggleMute}
-              className={`call-control-btn ${callMuted ? 'active' : ''}`}
-              aria-label={callMuted ? 'Unmute' : 'Mute'}
-            >
-              {callMuted ? 'unmute' : 'mute'}
-            </button>
-            {callType === 'video' && (
+          <div className="call-visualizers">
+            <div className="visualizer-row">
+              <AudioVisualizer stream={localStream} color="#22c55e" height={40} label="you" />
               <button
-                onClick={onToggleVideo}
-                className={`call-control-btn ${callVideoOff ? 'active' : ''}`}
-                aria-label={callVideoOff ? 'Turn on camera' : 'Turn off camera'}
+                onClick={onToggleMute}
+                className={`viz-control-btn ${callMuted ? 'active' : ''}`}
+                aria-label={callMuted ? 'Unmute' : 'Mute'}
+                title={callMuted ? 'Unmute' : 'Mute'}
               >
-                {callVideoOff ? 'cam on' : 'cam off'}
+                {callMuted ? '\u{1F507}' : '\u{1F3A4}'}
               </button>
-            )}
+              {callType === 'video' && (
+                <button
+                  onClick={onToggleVideo}
+                  className={`viz-control-btn ${callVideoOff ? 'active' : ''}`}
+                  aria-label={callVideoOff ? 'Turn on camera' : 'Turn off camera'}
+                  title={callVideoOff ? 'Turn on camera' : 'Turn off camera'}
+                >
+                  {callVideoOff ? '\u{1F6AB}' : '\u{1F4F9}'}
+                </button>
+              )}
+            </div>
+            {[...remoteStreams.entries()].map(([peerId, stream]) => (
+              <div key={peerId} className="visualizer-row">
+                <AudioVisualizer stream={stream} color="#3b82f6" height={40} label={peerId} />
+              </div>
+            ))}
+          </div>
+          <div className="call-controls">
             <button onClick={onEndCall} className="call-control-btn end-call" aria-label="End call">
               end
             </button>
@@ -233,14 +250,27 @@ export default function ChatView({
 
       {shareLink && (
         <div className="share-section">
-          <button
-            type="button"
-            className={`share-bar ${copied ? 'copied' : ''}`}
-            onClick={onCopyShareLink}
-            aria-label="Copy share link to clipboard"
-          >
-            {copied ? 'copied!' : 'share link (click to copy)'}
-          </button>
+          <div className="share-link-display">
+            <p className="share-label">send this link to invite others:</p>
+            <div className="share-url-row">
+              <input
+                type="text"
+                className="share-url-input"
+                value={shareLink}
+                readOnly
+                onClick={(e) => e.target.select()}
+                aria-label="Share link URL"
+              />
+              <button
+                type="button"
+                className={`share-copy-btn ${copied ? 'copied' : ''}`}
+                onClick={onCopyShareLink}
+                aria-label="Copy share link to clipboard"
+              >
+                {copied ? 'copied!' : 'copy'}
+              </button>
+            </div>
+          </div>
           {qrDataURL && (
             <button
               type="button"
@@ -277,13 +307,14 @@ export default function ChatView({
             className={`message ${msg.own ? 'own' : ''} ${msg.error ? 'error' : ''} ${msg.queued ? 'queued' : ''}`}
             data-msg-id={msg.id}
             ref={(el) => {
-              if (el && !msg.own && observerRef.current) {
+              if (el && !msg.own && observerRef.current && !observedElsRef.current.has(el)) {
+                observedElsRef.current.add(el)
                 observerRef.current.observe(el)
               }
             }}
           >
-            {!msg.own && !msg.system && msg.senderNickname && (
-              <span className="msg-sender">{msg.senderNickname}</span>
+            {!msg.system && (msg.own ? msg.ownNickname : msg.senderNickname) && (
+              <span className="msg-sender">{msg.own ? msg.ownNickname : msg.senderNickname}</span>
             )}
             {msg.media ? (
               <div className="media-preview">
@@ -315,8 +346,12 @@ export default function ChatView({
       {typingText && (
         <div className="typing-indicator" aria-live="polite">{typingText}</div>
       )}
-      <canvas ref={canvasRef} width={400} height={300} className="share-canvas" style={{ cursor: 'crosshair' }} />
-      <button type="button" className="canvas-clear-btn" onClick={clearCanvas} aria-label="Clear canvas">clear</button>
+      {canvasVisible && (
+        <>
+          <canvas ref={canvasRef} width={400} height={300} className="share-canvas" style={{ cursor: 'crosshair' }} />
+          <button type="button" className="canvas-clear-btn" onClick={clearCanvas} aria-label="Clear canvas">clear</button>
+        </>
+      )}
       <form onSubmit={onSend} className="send-form" aria-label="Send a message">
         <input
           type="file"
@@ -326,7 +361,8 @@ export default function ChatView({
           hidden
         />
         <button type="button" className="attach-btn" onClick={() => fileInputRef.current?.click()} aria-label="Attach file">+</button>
-        <button type="button" className="canvas-btn" onClick={onCanvasShare} aria-label="Share canvas">canvas</button>
+        <button type="button" className="canvas-btn" onClick={() => setCanvasVisible(v => !v)} aria-label="Toggle canvas">{canvasVisible ? 'hide canvas' : 'canvas'}</button>
+        {canvasVisible && <button type="button" className="canvas-btn" onClick={onCanvasShare} aria-label="Share canvas">share</button>}
         <input
           type="text"
           value={input}

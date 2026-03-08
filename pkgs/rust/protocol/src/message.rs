@@ -98,6 +98,39 @@ mod tests {
         let json = r#"{"type":"bogus","room":"r","timestamp":0}"#;
         assert!(serde_json::from_str::<Message>(json).is_err());
     }
+
+    #[test]
+    fn validate_empty_room_fails() {
+        let msg = Message::new(MessageType::Join, "".into(), None);
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("room"));
+    }
+
+    #[test]
+    fn validate_chat_without_payload_fails() {
+        let msg = Message::new(MessageType::Chat, "room1".into(), None);
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("payload"));
+    }
+
+    #[test]
+    fn validate_chat_with_empty_payload_fails() {
+        let msg = Message::new(MessageType::Chat, "room1".into(), Some("".into()));
+        let err = msg.validate().unwrap_err();
+        assert!(err.to_string().contains("payload"));
+    }
+
+    #[test]
+    fn validate_join_without_payload_ok() {
+        let msg = Message::new(MessageType::Join, "room1".into(), None);
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_chat_with_payload_ok() {
+        let msg = Message::new(MessageType::Chat, "room1".into(), Some("hello".into()));
+        assert!(msg.validate().is_ok());
+    }
 }
 
 impl Message {
@@ -112,5 +145,22 @@ impl Message {
                 .unwrap_or_default()
                 .as_millis() as u64,
         }
+    }
+
+    /// Validate a deserialized message for required field constraints.
+    pub fn validate(&self) -> Result<(), crate::ProtocolError> {
+        if self.room.is_empty() {
+            return Err(crate::ProtocolError::MissingField("room"));
+        }
+        // Types that carry data must have a payload
+        match self.msg_type {
+            MessageType::Chat | MessageType::Media | MessageType::KeyRotation | MessageType::Signal => {
+                if self.payload.as_ref().is_none_or(|p| p.is_empty()) {
+                    return Err(crate::ProtocolError::MissingField("payload"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }

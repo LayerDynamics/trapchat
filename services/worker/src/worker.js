@@ -1,8 +1,4 @@
-const logger = {
-  info: (msg, data) => console.log(JSON.stringify({ level: 'info', msg, ...data, time: new Date().toISOString() })),
-  warn: (msg, data) => console.log(JSON.stringify({ level: 'warn', msg, ...data, time: new Date().toISOString() })),
-  error: (msg, data) => console.error(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
-};
+import { logger } from './logger.js';
 
 const FETCH_TIMEOUT = 15_000;
 const ALLOWED_GATEWAY_HOSTS = (process.env.ALLOWED_GATEWAY_HOSTS || 'localhost,127.0.0.1').split(',').map(h => h.trim());

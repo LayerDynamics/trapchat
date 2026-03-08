@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -41,10 +44,12 @@ const (
 // Messages are sent via the sendCh channel and drained by a dedicated goroutine,
 // preventing a slow peer from blocking broadcasts to others.
 type peer struct {
-	conn   *websocket.Conn
-	wmu    sync.Mutex
-	sendCh chan []byte
-	done   chan struct{}
+	conn     *websocket.Conn
+	wmu      sync.Mutex
+	sendCh   chan []byte
+	done     chan struct{}
+	id       string
+	dropped  atomic.Int64
 }
 
 func newPeer(conn *websocket.Conn) *peer {
@@ -76,7 +81,8 @@ func (p *peer) enqueue(data []byte) {
 	select {
 	case p.sendCh <- data:
 	default:
-		// Drop message for slow peer rather than blocking the broadcaster
+		count := p.dropped.Add(1)
+		slog.Warn("dropped message for slow peer", "peer", p.id, "dropped_total", count, "buf_size", len(p.sendCh))
 	}
 }
 
@@ -101,6 +107,7 @@ type rateLimiter struct {
 	rate     int           // tokens per interval
 	interval time.Duration // refill interval
 	burst    int           // max tokens (burst capacity)
+	stopCh   chan struct{}  // closed to stop pruneLoop
 }
 
 type tokenBucket struct {
@@ -114,6 +121,7 @@ func newRateLimiter(rate int, interval time.Duration, burst int) *rateLimiter {
 		rate:     rate,
 		interval: interval,
 		burst:    burst,
+		stopCh:   make(chan struct{}),
 	}
 	go rl.pruneLoop()
 	return rl
@@ -125,20 +133,30 @@ func newRateLimiter(rate int, interval time.Duration, burst int) *rateLimiter {
 func (rl *rateLimiter) pruneLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		staleThreshold := rl.interval * time.Duration(rl.burst)
-		if staleThreshold < time.Minute {
-			staleThreshold = time.Minute
-		}
-		for id, b := range rl.buckets {
-			if now.Sub(b.lastFill) > staleThreshold {
-				delete(rl.buckets, id)
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			staleThreshold := rl.interval * time.Duration(rl.burst)
+			if staleThreshold < time.Minute {
+				staleThreshold = time.Minute
 			}
+			for id, b := range rl.buckets {
+				if now.Sub(b.lastFill) > staleThreshold {
+					delete(rl.buckets, id)
+				}
+			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
+}
+
+// stop terminates the pruneLoop goroutine.
+func (rl *rateLimiter) stop() {
+	close(rl.stopCh)
 }
 
 // allow returns true if the peer is within rate limits.
@@ -208,10 +226,59 @@ type Server struct {
 	authToken string // optional — set via AUTH_TOKEN env var
 	serverKey []byte // AES-256-GCM key for server-side envelope signing
 
-	workerURL    string // optional — set via WORKER_URL env var
-	workerClient *http.Client
+	workerURL       string // optional — set via WORKER_URL env var
+	workerAuthToken string // optional — set via WORKER_AUTH_TOKEN env var
+	workerClient    *http.Client
 
 	startTime time.Time // set in NewServer for uptime tracking
+	stopCh    chan struct{} // closed on shutdown to stop background goroutines
+}
+
+// stop shuts down all background goroutines (rate limiter prune loops, ttlExpiryLoop, cleanupLoop).
+func (s *Server) stop() {
+	close(s.stopCh)
+	s.rl.stop()
+	s.typingRL.stop()
+	s.signalRL.stop()
+	// Close relay connections to unblock ReadMessage in connectRelayInstance
+	for _, ri := range s.relays {
+		ri.mu.Lock()
+		if ri.conn != nil {
+			ri.conn.Close()
+		}
+		ri.mu.Unlock()
+	}
+}
+
+// disconnectAllPeers removes all peers from a room, closing connections
+// for peers that have no remaining rooms.
+func (s *Server) disconnectAllPeers(roomName string) int {
+	peerIDs := s.store.Peers(roomName)
+	for _, pid := range peerIDs {
+		var shouldClose bool
+		var p *peer
+
+		s.connMu.Lock()
+		if pp, ok := s.conns[pid]; ok {
+			p = pp
+			if rooms := s.peerRooms[pid]; rooms != nil {
+				delete(rooms, roomName)
+				if len(rooms) == 0 {
+					delete(s.peerRooms, pid)
+					delete(s.conns, pid)
+					shouldClose = true
+				}
+			}
+		}
+		s.connMu.Unlock()
+
+		s.store.Leave(roomName, pid)
+		if shouldClose {
+			p.closeSend()
+			p.conn.Close()
+		}
+	}
+	return len(peerIDs)
 }
 
 // allowedOrigins returns the set of permitted WebSocket origins from the
@@ -267,9 +334,11 @@ func NewServer() *Server {
 		signalRL:  newRateLimiter(50, time.Second, 100), // ICE trickle needs high burst
 		authToken: os.Getenv("AUTH_TOKEN"),
 		serverKey: serverKey,
-		workerURL:    os.Getenv("WORKER_URL"),
-		workerClient: &http.Client{Timeout: 10 * time.Second},
+		workerURL:       os.Getenv("WORKER_URL"),
+		workerAuthToken: os.Getenv("WORKER_AUTH_TOKEN"),
+		workerClient:    &http.Client{Timeout: 10 * time.Second},
 		startTime:    time.Now(),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -335,7 +404,6 @@ func main() {
 		Handler:           mux,
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -349,6 +417,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
+		srv.stop()
 		if err := httpSrv.Shutdown(ctx); err != nil {
 			slog.Error("graceful shutdown error", "error", err)
 		}
@@ -378,11 +447,23 @@ func (s *Server) connectRelayInstance(ri *relayInstance) {
 	maxBackoff := 30 * time.Second
 
 	for {
+		select {
+		case <-s.stopCh:
+			slog.Info("relay connector shutting down", "url", ri.url)
+			return
+		default:
+		}
+
 		slog.Info("connecting to relay instance", "url", ri.url)
 		conn, _, err := websocket.DefaultDialer.Dial(ri.url, nil)
 		if err != nil {
 			slog.Warn("relay instance dial error", "url", ri.url, "error", err, "retry_in", backoff)
-			time.Sleep(backoff)
+			select {
+			case <-s.stopCh:
+				slog.Info("relay connector shutting down during backoff", "url", ri.url)
+				return
+			case <-time.After(backoff):
+			}
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
@@ -404,7 +485,7 @@ func (s *Server) connectRelayInstance(ri *relayInstance) {
 			s.relayMu.Unlock()
 		}
 
-		// Read loop
+		// Read loop — closing the connection (via stop) will unblock ReadMessage
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -430,8 +511,21 @@ func (s *Server) connectRelayInstance(ri *relayInstance) {
 		}
 		conn.Close()
 
+		// Check for shutdown before reconnect backoff
+		select {
+		case <-s.stopCh:
+			slog.Info("relay connector shutting down after disconnect", "url", ri.url)
+			return
+		default:
+		}
+
 		slog.Warn("relay instance disconnected, reconnecting", "url", ri.url, "delay", backoff)
-		time.Sleep(backoff)
+		select {
+		case <-s.stopCh:
+			slog.Info("relay connector shutting down during backoff", "url", ri.url)
+			return
+		case <-time.After(backoff):
+		}
 	}
 }
 
@@ -502,7 +596,15 @@ func (s *Server) submitJob(jobType string, data map[string]interface{}) error {
 	if err != nil {
 		return err
 	}
-	resp, err := s.workerClient.Post(s.workerURL+"/jobs", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, s.workerURL+"/jobs", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if s.workerAuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.workerAuthToken)
+	}
+	resp, err := s.workerClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -518,7 +620,13 @@ func (s *Server) ttlExpiryLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+
 		expired := s.store.ExpiredRooms()
 		for _, roomName := range expired {
 			slog.Info("room TTL expired", "room", roomName)
@@ -533,35 +641,7 @@ func (s *Server) ttlExpiryLoop() {
 			}
 			s.broadcast(roomName, sysEnv, "")
 
-			// Disconnect all peers
-			peerIDs := s.store.Peers(roomName)
-			for _, pid := range peerIDs {
-				s.connMu.Lock()
-				p, ok := s.conns[pid]
-				if ok {
-					// Remove this room from peer's room set
-					if rooms := s.peerRooms[pid]; rooms != nil {
-						delete(rooms, roomName)
-						if len(rooms) == 0 {
-							delete(s.peerRooms, pid)
-							delete(s.conns, pid)
-						}
-					}
-				}
-				s.connMu.Unlock()
-
-				s.store.Leave(roomName, pid)
-				// Only close connection if peer has no remaining rooms
-				if ok {
-					s.connMu.RLock()
-					_, stillActive := s.conns[pid]
-					s.connMu.RUnlock()
-					if !stillActive {
-						p.closeSend()
-						p.conn.Close()
-					}
-				}
-			}
+			s.disconnectAllPeers(roomName)
 			// Force cleanup any remaining state
 			s.store.Leave(roomName, "__ttl_cleanup__")
 		}
@@ -573,7 +653,13 @@ func (s *Server) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+
 		gatewayPort := os.Getenv("GATEWAY_PORT")
 		if gatewayPort == "" {
 			gatewayPort = "8080"
@@ -626,7 +712,7 @@ func (s *Server) handleHealthAll(w http.ResponseWriter, r *http.Request) {
 		result["relay"] = serviceStatus{Status: "unreachable", Service: "relay"}
 	} else {
 		var sr serviceStatus
-		json.NewDecoder(resp.Body).Decode(&sr)
+		json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&sr) // 64KB limit
 		resp.Body.Close()
 		if sr.Status == "" {
 			sr.Status = "ok"
@@ -641,7 +727,7 @@ func (s *Server) handleHealthAll(w http.ResponseWriter, r *http.Request) {
 			result["worker"] = serviceStatus{Status: "unreachable", Service: "worker"}
 		} else {
 			var sr serviceStatus
-			json.NewDecoder(resp.Body).Decode(&sr)
+			json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&sr) // 64KB limit
 			resp.Body.Close()
 			if sr.Status == "" {
 				sr.Status = "ok"
@@ -662,7 +748,9 @@ func (s *Server) handleHealthAll(w http.ResponseWriter, r *http.Request) {
 	result["status"] = overall
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		slog.Error("encode error", "error", err)
+	}
 }
 
 // handleMetrics returns JSON with server metrics for monitoring and alerting.
@@ -740,6 +828,10 @@ func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	// Fall back to query parameter for WebSocket connections
 	if token == "" || token == r.Header.Get("Authorization") {
 		token = r.URL.Query().Get("token")
+		// Strip token from URL to prevent leaking into logs
+		q := r.URL.Query()
+		q.Del("token")
+		r.URL.RawQuery = q.Encode()
 	}
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -798,51 +890,29 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 		}
 		peers, lastActivity, exists := s.store.RoomInfo(roomName)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"peers":        peers,
 			"lastActivity": lastActivity,
 			"exists":       exists,
-		})
+		}); err != nil {
+			slog.Error("encode error", "error", err)
+		}
 
 	case "cleanup":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// Force-disconnect all peers in this room
-		peerIDs := s.store.Peers(roomName)
-		for _, pid := range peerIDs {
-			s.connMu.Lock()
-			p, ok := s.conns[pid]
-			if ok {
-				if rooms := s.peerRooms[pid]; rooms != nil {
-					delete(rooms, roomName)
-					if len(rooms) == 0 {
-						delete(s.peerRooms, pid)
-						delete(s.conns, pid)
-					}
-				}
-			}
-			s.connMu.Unlock()
-
-			s.store.Leave(roomName, pid)
-			if ok {
-				s.connMu.RLock()
-				_, stillActive := s.conns[pid]
-				s.connMu.RUnlock()
-				if !stillActive {
-					p.closeSend()
-					p.conn.Close()
-				}
-			}
-		}
+		disconnected := s.disconnectAllPeers(roomName)
 		// If room still exists with 0 peers (stale tracking), force remove via Leave with dummy
 		s.store.Leave(roomName, "__cleanup__")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"room":         roomName,
-			"disconnected": len(peerIDs),
-		})
+			"disconnected": disconnected,
+		}); err != nil {
+			slog.Error("encode error", "error", err)
+		}
 
 	case "ttl":
 		if r.Method != http.MethodGet {
@@ -855,11 +925,13 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			expiresAt = createdAt.Add(time.Duration(ttl) * time.Second).UnixMilli()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"ttlSeconds": ttl,
 			"expiresAt":  expiresAt,
 			"exists":     exists,
-		})
+		}); err != nil {
+			slog.Error("encode error", "error", err)
+		}
 
 	case "broadcast":
 		if r.Method != http.MethodPost {
@@ -894,7 +966,9 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 		}
 		s.broadcast(roomName, env, "")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": "broadcast sent", "room": roomName})
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{"status": "broadcast sent", "room": roomName}); err != nil {
+			slog.Error("encode error", "error", err)
+		}
 
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
@@ -925,6 +999,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	p := newPeer(conn)
+	p.id = peerID
 	s.connMu.Lock()
 	s.conns[peerID] = p
 	s.connMu.Unlock()
@@ -1053,8 +1128,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			s.peerRooms[peerID][env.Room] = true
 			s.connMu.Unlock()
 
-			// Atomic join + TTL — eliminates TOCTOU race and TTL gap
-			s.store.JoinWithTTL(env.Room, peerID, ttlForJoin)
+			// Decode and validate optional salt from join payload (must be exactly 32 bytes)
+			var saltBytes []byte
+			if jp.Salt != "" {
+				decoded, err := base64.StdEncoding.DecodeString(jp.Salt)
+				if err != nil {
+					s.sendError(p, "invalid salt encoding")
+					continue
+				}
+				if len(decoded) != 32 {
+					s.sendError(p, "salt must be exactly 32 bytes")
+					continue
+				}
+				saltBytes = decoded
+			}
+
+			// Atomic join + TTL + salt — eliminates TOCTOU race and TTL gap
+			s.store.JoinWithTTL(env.Room, peerID, ttlForJoin, saltBytes)
 
 			nick := sanitizeNickname(jp.Nickname)
 			if nick != "" {
@@ -1345,6 +1435,9 @@ func (s *Server) broadcastPresence(room string) {
 	if ttl, createdAt, ok := s.store.RoomTTL(room); ok && ttl > 0 {
 		pp.TTLSeconds = ttl
 		pp.ExpiresAt = createdAt.Add(time.Duration(ttl) * time.Second).UnixMilli()
+	}
+	if salt := s.store.RoomSalt(room); salt != nil {
+		pp.Salt = base64.StdEncoding.EncodeToString(salt)
 	}
 	payload, err := json.Marshal(pp)
 	if err != nil {

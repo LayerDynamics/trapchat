@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -291,6 +292,62 @@ func TestSetRoomTTLNonexistentRoom(t *testing.T) {
 	}
 }
 
+func TestJoinWithTTLSaltStored(t *testing.T) {
+	s := NewStore()
+	salt := []byte("0123456789abcdef0123456789abcdef") // 32 bytes
+	count, isNew := s.JoinWithTTL("room1", "peer1", 0, salt)
+	if count != 1 || !isNew {
+		t.Fatalf("expected count=1 isNew=true, got count=%d isNew=%v", count, isNew)
+	}
+	got := s.RoomSalt("room1")
+	if got == nil {
+		t.Fatal("expected salt, got nil")
+	}
+	if string(got) != string(salt) {
+		t.Fatalf("expected salt %q, got %q", salt, got)
+	}
+}
+
+func TestJoinWithTTLSaltFirstWriterWins(t *testing.T) {
+	s := NewStore()
+	salt1 := []byte("first-salt-value-that-is-32bytes")
+	salt2 := []byte("second-salt-value-that-is-32byte")
+	s.JoinWithTTL("room1", "peer1", 0, salt1)
+	s.JoinWithTTL("room1", "peer2", 0, salt2)
+	got := s.RoomSalt("room1")
+	if string(got) != string(salt1) {
+		t.Fatalf("expected first salt %q, got %q", salt1, got)
+	}
+}
+
+func TestRoomSaltNilForNoSalt(t *testing.T) {
+	s := NewStore()
+	s.JoinWithTTL("room1", "peer1", 0, nil)
+	got := s.RoomSalt("room1")
+	if got != nil {
+		t.Fatalf("expected nil salt, got %v", got)
+	}
+}
+
+func TestRoomSaltNilForNonexistent(t *testing.T) {
+	s := NewStore()
+	got := s.RoomSalt("nope")
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestSaltClearedWhenLastPeerLeaves(t *testing.T) {
+	s := NewStore()
+	salt := []byte("0123456789abcdef0123456789abcdef")
+	s.JoinWithTTL("room1", "peer1", 0, salt)
+	s.Leave("room1", "peer1")
+	got := s.RoomSalt("room1")
+	if got != nil {
+		t.Fatalf("expected nil after room deleted, got %v", got)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	s := NewStore()
 	var wg sync.WaitGroup
@@ -299,7 +356,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			room := "room1"
-			peer := "peer" + string(rune('A'+id%26))
+			peer := fmt.Sprintf("peer%d", id)
 			s.Join(room, peer)
 			s.Count(room)
 			s.Peers(room)

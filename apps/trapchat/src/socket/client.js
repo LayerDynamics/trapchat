@@ -20,9 +20,11 @@ export class TrapChatClient {
 
   connect() {
     return new Promise((resolve, reject) => {
+      let settled = false;
       this.#ws = new WebSocket(this.#url);
 
       this.#ws.onopen = () => {
+        settled = true;
         this.#reconnectAttempts = 0;
         this.#emit('open');
         // Rejoin all rooms after reconnect
@@ -39,12 +41,19 @@ export class TrapChatClient {
 
       this.#ws.onerror = (err) => {
         this.#emit('error', err);
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
       };
 
       this.#ws.onclose = (e) => {
         this.#emit('close', e);
-        this.#attemptReconnect();
+        // Only auto-reconnect after a successful connection;
+        // initial connect failures surface via the rejected promise.
+        if (settled) {
+          this.#attemptReconnect();
+        }
       };
 
       this.#ws.onmessage = (e) => {
@@ -80,6 +89,10 @@ export class TrapChatClient {
    */
   send(type, room, payload, { msgId } = {}) {
     if (type === 'join') {
+      if (!this.#joinedRooms.has(room) && this.#joinedRooms.size >= MAX_ROOMS) {
+        this.#emit('error', { code: 'MAX_ROOMS', message: `Cannot join more than ${MAX_ROOMS} rooms` });
+        return false;
+      }
       this.#joinedRooms.set(room, payload);
     } else if (type === 'leave') {
       this.#joinedRooms.delete(room);
@@ -157,13 +170,23 @@ export class TrapChatClient {
     }
   }
 
-  /** Send a raw pre-serialized message string. */
+  /**
+   * Send a pre-serialized JSON message string.
+   * Validates that the message is valid JSON with required protocol fields
+   * (type, room) before sending. Only 'signal' type is allowed via this path
+   * to prevent bypassing protocol constraints in send().
+   */
   sendRaw(msg) {
-    if (this.#ws && this.#ws.readyState === WebSocket.OPEN) {
-      this.#ws.send(msg)
-      return true
+    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) return false
+    try {
+      const parsed = JSON.parse(msg)
+      if (!parsed.type || !parsed.room) return false
+      if (parsed.type !== 'signal') return false
+    } catch {
+      return false
     }
-    return false
+    this.#ws.send(msg)
+    return true
   }
 
   /** Emit an event externally (e.g., from WebRTC data channel). */
