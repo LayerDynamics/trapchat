@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import JoinView from './JoinView.jsx'
 
 const ACCEPTED_FILE_TYPES = 'image/*,video/*,application/pdf'
 
@@ -73,6 +74,11 @@ function formatTimeRemaining(ms) {
 
 export default function ChatView({
   room,
+  rooms,
+  activeRoom,
+  onSwitchRoom,
+  onAddRoom,
+  onLeaveRoom,
   status,
   peerCount,
   peerNicknames,
@@ -99,14 +105,28 @@ export default function ChatView({
   observerRef,
   onFileSelect,
   onCanvasShare,
+  unreadCounts,
+  showJoinModal,
+  joinModalProps,
+  callActive,
+  callType,
+  remoteStreams,
+  onStartCall,
+  onEndCall,
+  onToggleMute,
+  onToggleVideo,
+  callMuted,
+  callVideoOff,
+  localVideoRef,
 }) {
   useCanvasDrawing(canvasRef)
 
   const [timeRemaining, setTimeRemaining] = useState(null)
   useEffect(() => {
     if (!expiresAt) {
-      setTimeRemaining(null)
-      return
+      // Reset outside the synchronous effect body via microtask
+      const t = setTimeout(() => setTimeRemaining(null), 0)
+      return () => clearTimeout(t)
     }
     const update = () => {
       const remaining = expiresAt - Date.now()
@@ -130,14 +150,87 @@ export default function ChatView({
 
   return (
     <div className="container chat-container" role="main">
+      {/* Room tabs */}
+      {rooms && rooms.length > 0 && (
+        <div className="room-tabs">
+          {rooms.map(r => (
+            <button
+              key={r}
+              className={`room-tab ${r === activeRoom ? 'active' : ''}`}
+              onClick={() => onSwitchRoom(r)}
+            >
+              #{r}
+              {unreadCounts && unreadCounts[r] > 0 && r !== activeRoom && (
+                <span className="unread-badge">{unreadCounts[r]}</span>
+              )}
+              <span
+                className="room-tab-close"
+                onClick={(e) => { e.stopPropagation(); onLeaveRoom(r) }}
+                aria-label={`Leave room ${r}`}
+              >&times;</span>
+            </button>
+          ))}
+          <button className="room-tab add-room-tab" onClick={onAddRoom} aria-label="Join another room">+</button>
+        </div>
+      )}
+
       <header className="chat-header">
         <span className={`status-dot ${status === 'connected' ? 'green' : status.startsWith('reconnecting') ? 'yellow' : 'red'}`} aria-label={`Connection status: ${status}`} />
         <span className="room-name">#{room}</span>
         <span className="peer-count" aria-live="polite" title={peerNicknames && Object.values(peerNicknames).filter(Boolean).join(', ')}>{peerCount} online</span>
         {p2p && <span className="p2p-badge">p2p</span>}
         {timeRemaining !== null && <span className="ttl-countdown">{formatTimeRemaining(timeRemaining)}</span>}
+        {!callActive && (
+          <>
+            <button onClick={() => onStartCall('audio')} className="call-btn" aria-label="Voice call" title="Voice call">&#127908;</button>
+            <button onClick={() => onStartCall('video')} className="call-btn" aria-label="Video call" title="Video call">&#128249;</button>
+          </>
+        )}
         <button onClick={onLeave} className="leave-btn" aria-label="Leave room">leave</button>
       </header>
+
+      {/* Call overlay */}
+      {callActive && (
+        <div className="call-overlay">
+          <div className="call-videos">
+            <video ref={localVideoRef} muted autoPlay playsInline className="local-video" />
+            {[...remoteStreams.entries()].map(([peerId, stream]) => (
+              <video
+                key={peerId}
+                autoPlay
+                playsInline
+                className="remote-video"
+                ref={el => { if (el) el.srcObject = stream }}
+              />
+            ))}
+            {remoteStreams.size === 0 && (
+              <div className="call-waiting">waiting for others to join...</div>
+            )}
+          </div>
+          <div className="call-controls">
+            <button
+              onClick={onToggleMute}
+              className={`call-control-btn ${callMuted ? 'active' : ''}`}
+              aria-label={callMuted ? 'Unmute' : 'Mute'}
+            >
+              {callMuted ? 'unmute' : 'mute'}
+            </button>
+            {callType === 'video' && (
+              <button
+                onClick={onToggleVideo}
+                className={`call-control-btn ${callVideoOff ? 'active' : ''}`}
+                aria-label={callVideoOff ? 'Turn on camera' : 'Turn off camera'}
+              >
+                {callVideoOff ? 'cam on' : 'cam off'}
+              </button>
+            )}
+            <button onClick={onEndCall} className="call-control-btn end-call" aria-label="End call">
+              end
+            </button>
+          </div>
+        </div>
+      )}
+
       {shareLink && (
         <div className="share-section">
           <button
@@ -244,6 +337,15 @@ export default function ChatView({
         />
         <button type="submit">send</button>
       </form>
+
+      {/* Join room modal */}
+      {showJoinModal && joinModalProps && (
+        <div className="join-modal-backdrop" onClick={joinModalProps.onClose}>
+          <div className="join-modal" onClick={e => e.stopPropagation()}>
+            <JoinView {...joinModalProps} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
