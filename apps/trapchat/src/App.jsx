@@ -1,120 +1,110 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import QRCode from 'qrcode'
 import { TrapChatClient } from './socket/client.js'
-import { generateRoomKey, exportKey, importKey, encrypt, deriveRoomKey } from './lib/crypto.js'
+import { encrypt, decrypt, uint8ToBase64, base64ToUint8, deriveRoomKey, importKey } from './lib/crypto.js'
+import { useRoomManager } from './hooks/useRoomManager.js'
+import { useWebRTCMesh } from './hooks/useWebRTCMesh.js'
+import { useCallManager } from './hooks/useCallManager.js'
 import { useKeyRotation } from './hooks/useKeyRotation.js'
 import { useTypingIndicator } from './hooks/useTypingIndicator.js'
 import { useMediaTransfer } from './hooks/useMediaTransfer.js'
-import { PeerConnection, PeerMesh } from './lib/webrtc.js'
 import JoinView from './components/JoinView.jsx'
 import ChatView from './components/ChatView.jsx'
 import './App.css'
 
-const MAX_MESSAGES = 500
-const MAX_ROOM_NAME_LEN = 64
-const MAX_TEXT_LENGTH = 50000
-const MAX_ROOMS = 5
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) return 'unsupported'
+  if (Notification.permission === 'granted') return 'granted'
+  if (Notification.permission === 'denied') return 'denied'
+  return await Notification.requestPermission()
+}
+
+const ADJECTIVES = [
+  'swift', 'silent', 'shadow', 'neon', 'ghost', 'lunar', 'cosmic', 'cyber',
+  'arctic', 'ember', 'crystal', 'iron', 'velvet', 'crimson', 'golden', 'hidden',
+  'storm', 'frost', 'dark', 'wild', 'rogue', 'phantom', 'mystic', 'chrome',
+  'atomic', 'blazing', 'hollow', 'vivid', 'ancient', 'static', 'turbo', 'solar',
+]
+const NOUNS = [
+  'wolf', 'hawk', 'viper', 'fox', 'panther', 'cobra', 'raven', 'tiger',
+  'falcon', 'lynx', 'orca', 'jaguar', 'phoenix', 'dragon', 'serpent', 'mantis',
+  'spark', 'bolt', 'pulse', 'flare', 'drift', 'wave', 'blade', 'echo',
+  'cipher', 'nexus', 'vertex', 'orbit', 'prism', 'wraith', 'spectre', 'sigma',
+]
+
+function secureRandom(max) {
+  const arr = new Uint32Array(1)
+  crypto.getRandomValues(arr)
+  return arr[0] % max
+}
+
+function generateRoomName() {
+  const adj = ADJECTIVES[secureRandom(ADJECTIVES.length)]
+  const noun = NOUNS[secureRandom(NOUNS.length)]
+  const num = secureRandom(1000)
+  return `${adj}-${noun}-${num}`
+}
+
+function generateNickname() {
+  const adj = ADJECTIVES[secureRandom(ADJECTIVES.length)]
+  const noun = NOUNS[secureRandom(NOUNS.length)]
+  return `${adj}${noun.charAt(0).toUpperCase()}${noun.slice(1)}`
+}
 
 function App() {
-  // Multi-room state: Map<roomName, roomState>
-  const [rooms, setRooms] = useState(new Map())
-  const [activeRoom, setActiveRoom] = useState('')
-  const [view, setView] = useState('join')
-  const [status, setStatus] = useState('disconnected')
-  const [nickname, setNickname] = useState('')
+  const [nickname, setNickname] = useState(generateNickname)
   const [showJoinModal, setShowJoinModal] = useState(false)
-
-  // Join form state (used for both initial join and modal)
   const [joinRoom, setJoinRoom] = useState(() => {
     const hash = window.location.hash.slice(1)
     if (hash.includes('/')) {
       const [roomName] = hash.split('/', 2)
       if (roomName) return decodeURIComponent(roomName)
     }
-    return ''
+    return generateRoomName()
   })
   const [passphrase, setPassphrase] = useState('')
   const [ttl, setTtl] = useState(0)
 
-  // Call state
-  const [callActive, setCallActive] = useState(false)
-  const [callType, setCallType] = useState(null) // 'audio' | 'video'
-  const [localStream, setLocalStream] = useState(null)
-  const [remoteStreams, setRemoteStreams] = useState(new Map()) // peerId -> MediaStream
-  const [callMuted, setCallMuted] = useState(false)
-  const [callVideoOff, setCallVideoOff] = useState(false)
-
-  const keyRefs = useRef(new Map()) // room -> CryptoKey
+  const clientRef = useRef(null)
   const bottomRef = useRef(null)
   const unsubsRef = useRef([])
-  const clientRef = useRef(null)
-  const peerNicknamesRef = useRef({}) // current active room's nicknames
-  const peerMeshRef = useRef(new Map()) // room -> PeerMesh
-  const prevPeerCountRef = useRef(new Map()) // room -> prevCount
+  const peerNicknamesRef = useRef({})
   const intentionalDisconnectRef = useRef(false)
   const observerRef = useRef(null)
-  const localVideoRef = useRef(null)
+  const pendingKeyRoomsRef = useRef(new Set()) // rooms currently re-deriving keys
+  const pendingMessagesRef = useRef(new Map()) // room -> [{data}] queued during key derivation
 
-  // Helper to get/set per-room state
-  const getRoomState = useCallback((roomName) => {
-    return rooms.get(roomName) || {
-      messages: [], input: '', expiresAt: null, peerCount: 0,
-      peerNicknames: {}, typingText: '', messageReceipts: {},
-      uploadProgress: null, downloadProgress: null, isP2P: false,
-      shareLink: '', copied: false, showQR: false, qrDataURL: '',
-      unreadCount: 0,
-    }
-  }, [rooms])
+  // --- Room Manager ---
+  const {
+    rooms, roomsRef, setRooms, activeRoom, setActiveRoom, view, setView,
+    status, setStatus, keyRefs, activeKeyRef, activeRoomRef,
+    saltRefs, passphraseRefs,
+    getRoomState, updateRoomState, appendMessageToRoom,
+    switchRoom, copyShareLink, setupRoomKey, removeRoom,
+    MAX_ROOMS, MAX_ROOM_NAME_LEN, MAX_TEXT_LENGTH,
+  } = useRoomManager()
 
-  const updateRoomState = useCallback((roomName, updater) => {
-    setRooms(prev => {
-      const next = new Map(prev)
-      const current = next.get(roomName) || {
-        messages: [], input: '', expiresAt: null, peerCount: 0,
-        peerNicknames: {}, typingText: '', messageReceipts: {},
-        uploadProgress: null, downloadProgress: null, isP2P: false,
-        shareLink: '', copied: false, showQR: false, qrDataURL: '',
-        unreadCount: 0,
-      }
-      next.set(roomName, typeof updater === 'function' ? updater(current) : { ...current, ...updater })
-      return next
-    })
-  }, [])
+  // --- Call Manager (initialized first for setRemoteStreams) ---
+  const {
+    callActive, callType, localStream, remoteStreams, setRemoteStreams,
+    callMuted, callVideoOff, localVideoRef,
+    startCall, endCall, handleIncomingCall,
+    toggleMute, toggleVideo,
+    peerMeshBridgeRef,
+  } = useCallManager({ clientRef, activeRoom })
+  const callActiveRef = useRef(callActive)
+  callActiveRef.current = callActive
 
-  const appendMessageToRoom = useCallback((roomName, msg) => {
-    setRooms(prev => {
-      const next = new Map(prev)
-      const current = next.get(roomName)
-      if (!current) return prev
-      let messages = [...current.messages, msg]
-      if (messages.length > MAX_MESSAGES) {
-        const evicted = messages.slice(0, messages.length - MAX_MESSAGES)
-        for (const m of evicted) {
-          if (m.media?.url && m.media.url.startsWith('blob:')) {
-            URL.revokeObjectURL(m.media.url)
-          }
-        }
-        messages = messages.slice(messages.length - MAX_MESSAGES)
-      }
-      const unreadCount = roomName !== activeRoomRef.current
-        ? (current.unreadCount || 0) + 1
-        : current.unreadCount
-      next.set(roomName, { ...current, messages, unreadCount })
-      return next
-    })
-  }, [])
+  // --- WebRTC Mesh ---
+  const {
+    peerMeshRef, makeSignalSender,
+    handlePresenceMesh, handleSignal: handleWebRTCSignal,
+    cleanupRoom: cleanupMeshRoom, cleanupAll: cleanupAllMeshes,
+  } = useWebRTCMesh({ clientRef, updateRoomState, setRemoteStreams })
 
-  // Keep a ref of activeRoom for use in callbacks
-  const activeRoomRef = useRef(activeRoom)
-  activeRoomRef.current = activeRoom
+  // Bridge peerMeshRef into call manager
+  peerMeshBridgeRef.current = peerMeshRef
 
-  // Hooks that need the active room context
-  const activeKeyRef = useRef(null)
-  // Sync activeKeyRef with the active room's key
-  useEffect(() => {
-    activeKeyRef.current = keyRefs.current.get(activeRoom) || null
-  }, [activeRoom, rooms])
-
+  // --- Existing hooks ---
   const { startRotation, stopRotation, handleKeyRotationMessage, decryptWithRotation } =
     useKeyRotation({ keyRef: activeKeyRef, clientRef, room: activeRoom, appendMessage: (msg) => appendMessageToRoom(activeRoom, msg) })
 
@@ -127,47 +117,6 @@ function App() {
     initAssembler, destroyAssembler, handleMediaChunk,
     handleFileSelect, handleCanvasShare, resetProgress,
   } = useMediaTransfer({ clientRef, keyRef: activeKeyRef, room: activeRoom, appendMessage: (msg) => appendMessageToRoom(activeRoom, msg) })
-
-  // Generate QR code when share link changes for active room
-  const activeState = getRoomState(activeRoom)
-  useEffect(() => {
-    if (!activeState.shareLink) return
-    let cancelled = false
-    QRCode.toDataURL(activeState.shareLink, { width: 200, margin: 2 })
-      .then((url) => { if (!cancelled) updateRoomState(activeRoom, { qrDataURL: url }) })
-      .catch(() => { if (!cancelled) updateRoomState(activeRoom, { qrDataURL: '' }) })
-    return () => { cancelled = true }
-  }, [activeState.shareLink, activeRoom, updateRoomState])
-
-  const copyShareLink = useCallback(async () => {
-    const link = rooms.get(activeRoom)?.shareLink
-    if (!link) return
-    try {
-      await navigator.clipboard.writeText(link)
-      updateRoomState(activeRoom, { copied: true })
-      setTimeout(() => updateRoomState(activeRoom, { copied: false }), 2000)
-    } catch {
-      const textarea = document.createElement('textarea')
-      textarea.value = link
-      textarea.setAttribute('readonly', '')
-      textarea.style.position = 'fixed'
-      textarea.style.left = '-9999px'
-      document.body.appendChild(textarea)
-      textarea.select()
-      try {
-        if (navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(link)
-        } else {
-          document.execCommand('copy')
-        }
-      } catch {
-        document.execCommand('copy')
-      }
-      document.body.removeChild(textarea)
-      updateRoomState(activeRoom, { copied: true })
-      setTimeout(() => updateRoomState(activeRoom, { copied: false }), 2000)
-    }
-  }, [activeRoom, rooms, updateRoomState])
 
   function getClient() {
     if (!clientRef.current) {
@@ -182,7 +131,7 @@ function App() {
 
   // Cleanup on unmount
   useEffect(() => {
-    const meshes = peerMeshRef.current
+    const meshRef = peerMeshRef
     return () => {
       unsubsRef.current.forEach(fn => fn())
       unsubsRef.current = []
@@ -196,22 +145,24 @@ function App() {
         observerRef.current.disconnect()
         observerRef.current = null
       }
-      for (const mesh of meshes.values()) {
+      for (const mesh of meshRef.current.values()) {
         mesh.closeAll()
       }
     }
-  }, [stopRotation, destroyAssembler])
+  }, [stopRotation, destroyAssembler, peerMeshRef])
 
-  // Check URL fragment for key on mount
+  // Request microphone permission when entering chat view
+  const hasRequestedMicRef = useRef(false)
   useEffect(() => {
-    const hash = window.location.hash.slice(1)
-    if (hash.includes('/')) {
-      const [roomName, keyFragment] = hash.split('/', 2)
-      if (roomName && keyFragment) {
-        keyRefs.current.set(decodeURIComponent(roomName), keyFragment)
-      }
+    if (view === 'chat' && !hasRequestedMicRef.current) {
+      hasRequestedMicRef.current = true
+      setTimeout(() => {
+        navigator.mediaDevices?.getUserMedia({ audio: true })
+          .then(stream => stream.getTracks().forEach(t => t.stop()))
+          .catch(() => {})
+      }, 500)
     }
-  }, [])
+  }, [view])
 
   // Handle visualViewport resize for mobile keyboard
   useEffect(() => {
@@ -231,24 +182,18 @@ function App() {
     }
   }, [activeRoom, sendTypingIndicator, updateRoomState])
 
-  // Create a PeerConnection signal sender for a given room and remote peer
-  const makeSignalSender = useCallback((room, remotePeerId) => {
-    return (signalPayload) => {
-      const msg = JSON.stringify({
-        id: crypto.randomUUID(), type: 'signal', room,
-        to: remotePeerId, payload: JSON.stringify(signalPayload), timestamp: Date.now(),
-      })
-      const client = clientRef.current
-      if (client?.connected) client.sendRaw(msg)
-    }
-  }, [])
+  const endCallRef = useRef(null)
+  const handleIncomingCallRef = useRef(null)
+  endCallRef.current = endCall
+  handleIncomingCallRef.current = handleIncomingCall
+
+  const setupGlobalHandlersRef = useRef(null)
 
   const handleJoinRoom = useCallback(async (e) => {
     e.preventDefault()
     const trimmed = joinRoom.trim()
     if (!trimmed || trimmed.length > MAX_ROOM_NAME_LEN) return
 
-    // Check max rooms
     if (rooms.size >= MAX_ROOMS && !rooms.has(trimmed)) {
       alert(`Max ${MAX_ROOMS} rooms — leave one first`)
       return
@@ -260,42 +205,22 @@ function App() {
     try {
       setStatus('connecting')
 
-      // Key setup
-      let key = keyRefs.current.get(trimmed)
-      let shareLink = ''
-      if (typeof key === 'string' && key) {
-        key = await importKey(key)
-        keyRefs.current.set(trimmed, key)
-        history.replaceState(null, '', window.location.pathname)
-      } else if (passphrase.trim()) {
-        key = await deriveRoomKey(trimmed, passphrase)
-        keyRefs.current.set(trimmed, key)
-      } else if (!key) {
-        key = await generateRoomKey()
-        keyRefs.current.set(trimmed, key)
-        const exported = await exportKey(key)
-        shareLink = `${window.location.origin}${window.location.pathname}#${encodeURIComponent(trimmed)}/${exported}`
-        history.replaceState(null, '', window.location.pathname)
-      }
+      const { shareLink } = await setupRoomKey(trimmed, passphrase)
 
-      // Connect if not already connected
       if (!client.connected) {
         await client.connect()
       }
       setStatus('connected')
 
-      // Initialize room state
       updateRoomState(trimmed, (s) => ({
         ...s,
         shareLink: shareLink || s.shareLink,
       }))
 
-      // Set up message handler if this is the first room
       if (rooms.size === 0 && unsubsRef.current.length === 0) {
-        setupGlobalHandlers(client)
+        setupGlobalHandlersRef.current(client)
       }
 
-      // Set up IntersectionObserver for read receipts
       if (!observerRef.current) {
         observerRef.current = new IntersectionObserver((entries) => {
           entries.forEach((entry) => {
@@ -313,18 +238,23 @@ function App() {
       const jpObj = {}
       if (nickname.trim()) jpObj.nickname = nickname.trim()
       if (ttl > 0) jpObj.ttlSeconds = ttl
+      // Include salt in join payload for passphrase-derived rooms
+      const roomSalt = saltRefs.current.get(trimmed)
+      if (roomSalt) jpObj.salt = uint8ToBase64(roomSalt)
       const joinPayload = Object.keys(jpObj).length > 0 ? JSON.stringify(jpObj) : null
       client.send('join', trimmed, joinPayload)
+
+      requestNotificationPermission()
 
       setActiveRoom(trimmed)
       setView('chat')
       setShowJoinModal(false)
       setPassphrase('')
     } catch (err) {
-      setStatus('error')
+      setStatus(`error: ${err.message || err}`)
       console.error('connection failed:', err)
     }
-  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState, setupGlobalHandlers])
+  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState, setupRoomKey, setStatus, setActiveRoom, setView, activeRoomRef, MAX_ROOM_NAME_LEN, MAX_ROOMS])
 
   const setupGlobalHandlers = useCallback((client) => {
     unsubsRef.current.forEach(fn => fn())
@@ -340,12 +270,46 @@ function App() {
       if (data.type === 'welcome') {
         // Handled by TrapChatClient internally
       } else if (data.type === 'room_list') {
-        // Server confirms joined rooms — no action needed
+        // Server confirms joined rooms
       } else if (data.type === 'presence') {
         try {
           const presence = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload
           const room = presence.room || msgRoom
           if (!room) return
+
+          // Handle salt from presence: if the server returns a different salt
+          // (room already existed with a salt from the first joiner), re-derive key
+          if (presence.salt) {
+            const serverSalt = base64ToUint8(presence.salt)
+            const cachedSalt = saltRefs.current.get(room)
+            const saltsMatch = cachedSalt && cachedSalt.length === serverSalt.length &&
+              cachedSalt.every((b, i) => b === serverSalt[i])
+            if (!saltsMatch) {
+              const pp = passphraseRefs.current.get(room)
+              if (pp) {
+                // Mark room as pending key derivation — messages will be queued
+                pendingKeyRoomsRef.current.add(room)
+                saltRefs.current.set(room, serverSalt)
+                const newKey = await deriveRoomKey(room, pp, serverSalt)
+                keyRefs.current.set(room, newKey)
+                if (room === activeRoomRef.current) {
+                  activeKeyRef.current = newKey
+                }
+                // Clear passphrase after successful derivation (minimize exposure)
+                passphraseRefs.current.delete(room)
+                // Flush any messages that arrived during derivation
+                pendingKeyRoomsRef.current.delete(room)
+                const queued = pendingMessagesRef.current.get(room)
+                if (queued && queued.length > 0) {
+                  pendingMessagesRef.current.delete(room)
+                  for (const qData of queued) {
+                    // Re-emit queued messages for processing
+                    client.emit('message', qData)
+                  }
+                }
+              }
+            }
+          }
 
           setRooms(prev => {
             const next = new Map(prev)
@@ -364,84 +328,15 @@ function App() {
             peerNicknamesRef.current = presence.peers
           }
 
-          // WebRTC mesh: manage P2P connections per room
+          // WebRTC mesh management
           const count = presence.count || 0
-          const prevCount = prevPeerCountRef.current.get(room) || 0
-          prevPeerCountRef.current.set(room, count)
-
-          if (count === 2 && prevCount !== 2) {
-            const selfId = client.peerId
-            const pids = presence.peers ? Object.keys(presence.peers) : []
-            const remotePid = pids.find(pid => pid !== selfId)
-            if (selfId && remotePid && selfId < remotePid) {
-              setTimeout(async () => {
-                if (peerMeshRef.current.has(room)) return
-                const pc = new PeerConnection(
-                  makeSignalSender(room, remotePid),
-                  (msgData) => {
-                    try { client.emitP2P('message', { ...JSON.parse(msgData), room }) } catch { /* ignore parse errors */ }
-                  }
-                )
-                pc.onConnected = () => {
-                  updateRoomState(room, (s) => ({ ...s, isP2P: true }))
-                }
-                pc.onDisconnected = () => {
-                  updateRoomState(room, (s) => ({ ...s, isP2P: false }))
-                }
-                // Store as a simple map entry (not PeerMesh for 2-peer case)
-                const mesh = new PeerMesh({
-                  onMessage: (pid, d) => {
-                    try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch { /* ignore parse errors */ }
-                  },
-                  onConnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: true })),
-                  onDisconnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: false })),
-                  onTrack: (pid, stream) => {
-                    setRemoteStreams(prev => new Map(prev).set(pid, stream))
-                  },
-                })
-                peerMeshRef.current.set(room, mesh)
-                try {
-                  await mesh.addPeer(remotePid, makeSignalSender(room, remotePid), true)
-                } catch (err) {
-                  console.error('WebRTC offer failed:', err)
-                  peerMeshRef.current.delete(room)
-                }
-              }, 500)
-            }
-          } else if (count !== 2 && peerMeshRef.current.has(room)) {
-            peerMeshRef.current.get(room).closeAll()
-            peerMeshRef.current.delete(room)
-            updateRoomState(room, (s) => ({ ...s, isP2P: false }))
-          }
+          await handlePresenceMesh(room, count, presence.peers, client.peerId)
         } catch {
           // ignore malformed presence
         }
       } else if (data.type === 'signal') {
         try {
-          const signalData = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload
-          const room = msgRoom
-
-          let mesh = peerMeshRef.current.get(room)
-          if (!mesh) {
-            mesh = new PeerMesh({
-              onMessage: (pid, d) => {
-                try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch { /* ignore parse errors */ }
-              },
-              onConnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: true })),
-              onDisconnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: false })),
-              onTrack: (pid, stream) => {
-                setRemoteStreams(prev => new Map(prev).set(pid, stream))
-              },
-            })
-            peerMeshRef.current.set(room, mesh)
-          }
-
-          if (signalData.signalType === 'offer') {
-            await mesh.addPeer(data.id, makeSignalSender(room, data.id), false)
-            await mesh.handleSignal(data.id, signalData)
-          } else {
-            await mesh.handleSignal(data.id, signalData)
-          }
+          await handleWebRTCSignal(data, msgRoom)
         } catch (err) {
           console.error('WebRTC signal handling error:', err)
         }
@@ -471,49 +366,49 @@ function App() {
       } else if (data.type === 'chat') {
         const room = msgRoom
         if (!room) return
-        const roomKey = keyRefs.current.get(room)
-        let text
-        try {
-          if (roomKey) {
-            // Use the room-specific key for decryption
-            const { decrypt } = await import('./lib/crypto.js')
-            text = await decrypt(roomKey, data.payload)
-          } else {
-            text = await decryptWithRotation(data.payload)
-          }
-          if (text.length > MAX_TEXT_LENGTH) {
-            text = text.slice(0, MAX_TEXT_LENGTH) + '... [truncated]'
-          }
-        } catch {
-          text = '[encrypted message — key mismatch]'
+        // Queue messages that arrive during key re-derivation
+        if (pendingKeyRoomsRef.current.has(room)) {
+          if (!pendingMessagesRef.current.has(room)) pendingMessagesRef.current.set(room, [])
+          pendingMessagesRef.current.get(room).push(data)
+          return
         }
-        const msgId = data.msgId || crypto.randomUUID()
-
-        // Get nicknames for this room
-        const roomState = rooms.get(room) || {}
-        const nicknames = roomState.peerNicknames || peerNicknamesRef.current
-
-        appendMessageToRoom(room, {
-          id: msgId,
-          text,
-          time: new Date().toLocaleTimeString(),
-          error: text === '[encrypted message — key mismatch]',
-          senderId: data.id,
-          senderNickname: nicknames[data.id] || (data.id ? data.id.slice(0, 8) : ''),
-        })
+        const msgId = await decryptAndAppendChat(data, room)
         client.send('receipt', room, JSON.stringify({ messageId: msgId, status: 'delivered' }))
       } else if (data.type === 'key_rotation') {
-        await handleKeyRotationMessage(data)
+        const room = msgRoom
+        if (!room) return
+        const roomKey = keyRefs.current.get(room)
+        if (room === activeRoomRef.current) {
+          await handleKeyRotationMessage(data)
+        } else if (roomKey) {
+          try {
+            const exportedNewKey = await decrypt(roomKey, data.payload)
+            const newKey = await importKey(exportedNewKey)
+            keyRefs.current.set(room, newKey)
+            appendMessageToRoom(room, {
+              id: crypto.randomUUID(),
+              text: '[key rotated by peer — encryption key updated]',
+              time: new Date().toLocaleTimeString(),
+              system: true,
+            })
+          } catch {
+            appendMessageToRoom(room, {
+              id: crypto.randomUUID(),
+              text: '[key rotation failed — could not decrypt new key]',
+              time: new Date().toLocaleTimeString(),
+              error: true,
+            })
+          }
+        }
       } else if (data.type === 'media') {
         await handleMediaChunk(data)
       } else if (data.type === 'call_offer') {
-        // Incoming call — show notification (auto-accept for now)
         const room = msgRoom
-        if (!callActive && room) {
-          handleIncomingCall(data.id, room, data.payload)
+        if (!callActiveRef.current && room) {
+          handleIncomingCallRef.current(data.id, room, data.payload)
         }
       } else if (data.type === 'call_end') {
-        endCall()
+        endCallRef.current()
       }
     }))
 
@@ -533,144 +428,52 @@ function App() {
       setStatus('connected')
     }))
 
+    // Shared decrypt-and-append logic for chat messages (WS and P2P)
+    async function decryptAndAppendChat(data, room, opts = {}) {
+      const roomKey = keyRefs.current.get(room)
+      let text
+      try {
+        if (roomKey) {
+          text = await decrypt(roomKey, data.payload)
+        } else {
+          text = await decryptWithRotation(data.payload)
+        }
+        if (text.length > MAX_TEXT_LENGTH) {
+          text = text.slice(0, MAX_TEXT_LENGTH) + '... [truncated]'
+        }
+      } catch {
+        text = '[encrypted message — key mismatch]'
+      }
+      const msgId = data.msgId || crypto.randomUUID()
+
+      const roomState = roomsRef.current.get(room) || {}
+      const nicknames = roomState.peerNicknames || peerNicknamesRef.current
+
+      appendMessageToRoom(room, {
+        id: msgId,
+        text,
+        time: new Date().toLocaleTimeString(),
+        error: text === '[encrypted message — key mismatch]',
+        senderId: data.id,
+        senderNickname: nicknames[data.id] || (data.id ? data.id.slice(0, 8) : ''),
+        ...opts,
+      })
+      return msgId
+    }
+
     // Handle P2P data channel messages
     unsubsRef.current.push(client.on('p2p:message', async (data) => {
       if (typeof data !== 'object') return
       const room = data.room || activeRoomRef.current
       if (data.type === 'chat') {
-        const roomKey = keyRefs.current.get(room)
-        let text
-        try {
-          if (roomKey) {
-            const { decrypt } = await import('./lib/crypto.js')
-            text = await decrypt(roomKey, data.payload)
-          } else {
-            text = await decryptWithRotation(data.payload)
-          }
-          if (text.length > MAX_TEXT_LENGTH) {
-            text = text.slice(0, MAX_TEXT_LENGTH) + '... [truncated]'
-          }
-        } catch {
-          text = '[encrypted message — key mismatch]'
-        }
-        const msgId = data.msgId || crypto.randomUUID()
-        appendMessageToRoom(room, {
-          id: msgId,
-          text,
-          time: new Date().toLocaleTimeString(),
-          error: text === '[encrypted message — key mismatch]',
-          senderId: data.id,
-          senderNickname: peerNicknamesRef.current[data.id] || (data.id ? data.id.slice(0, 8) : ''),
-          p2p: true,
-        })
+        await decryptAndAppendChat(data, room, { p2p: true })
       } else if (data.type === 'media') {
         handleMediaChunk(data)
       }
     }))
-  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, makeSignalSender, rooms, callActive, endCall, handleIncomingCall])
+  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, handlePresenceMesh, handleWebRTCSignal, setRooms, setStatus, activeRoomRef, keyRefs, roomsRef, MAX_TEXT_LENGTH])
 
-  const handleIncomingCall = useCallback(async (fromPeerId, room, payloadStr) => {
-    let type = 'audio'
-    try {
-      const p = typeof payloadStr === 'string' ? JSON.parse(payloadStr) : payloadStr
-      type = p?.callType || 'audio'
-    } catch { /* ignore malformed payload */ }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: type === 'video',
-      })
-      setLocalStream(stream)
-      setCallActive(true)
-      setCallType(type)
-
-      // Add stream to mesh
-      const mesh = peerMeshRef.current.get(room)
-      if (mesh) {
-        await mesh.broadcastStream(stream)
-      }
-
-      // Send call_answer
-      const client = clientRef.current
-      if (client?.connected) {
-        client.send('call_answer', room, JSON.stringify({ callType: type }))
-      }
-    } catch (err) {
-      console.error('Failed to get media for call:', err)
-    }
-  }, [])
-
-  const startCall = useCallback(async (type) => {
-    if (callActive || !activeRoom) return
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: type === 'video',
-      })
-      setLocalStream(stream)
-      setCallActive(true)
-      setCallType(type)
-
-      // Send call_offer to room
-      const client = clientRef.current
-      if (client?.connected) {
-        client.send('call_offer', activeRoom, JSON.stringify({ callType: type }))
-      }
-
-      // Add stream to mesh
-      const mesh = peerMeshRef.current.get(activeRoom)
-      if (mesh) {
-        await mesh.broadcastStream(stream)
-      }
-    } catch (err) {
-      console.error('Failed to start call:', err)
-    }
-  }, [callActive, activeRoom])
-
-  const endCall = useCallback(() => {
-    if (localStream) {
-      localStream.getTracks().forEach(t => t.stop())
-      setLocalStream(null)
-    }
-
-    // Remove streams from all meshes
-    for (const mesh of peerMeshRef.current.values()) {
-      mesh.removeAllStreams()
-    }
-
-    // Send call_end
-    const client = clientRef.current
-    if (client?.connected && activeRoom) {
-      client.send('call_end', activeRoom, null)
-    }
-
-    setCallActive(false)
-    setCallType(null)
-    setRemoteStreams(new Map())
-    setCallMuted(false)
-    setCallVideoOff(false)
-  }, [localStream, activeRoom])
-
-  const toggleMute = useCallback(() => {
-    if (localStream) {
-      const audioTrack = localStream.getAudioTracks()[0]
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled
-        setCallMuted(!audioTrack.enabled)
-      }
-    }
-  }, [localStream])
-
-  const toggleVideo = useCallback(() => {
-    if (localStream) {
-      const videoTrack = localStream.getVideoTracks()[0]
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled
-        setCallVideoOff(!videoTrack.enabled)
-      }
-    }
-  }, [localStream])
+  setupGlobalHandlersRef.current = setupGlobalHandlers
 
   const sendMessage = useCallback(async (e) => {
     e.preventDefault()
@@ -698,7 +501,6 @@ function App() {
       return
     }
     const msgId = crypto.randomUUID()
-    // Try P2P first
     let sent = false
     const mesh = peerMeshRef.current.get(activeRoom)
     if (mesh) {
@@ -724,10 +526,11 @@ function App() {
       text: currentState.input,
       time: new Date().toLocaleTimeString(),
       own: true,
+      ownNickname: nickname || null,
       queued: !sent,
     })
     updateRoomState(activeRoom, (s) => ({ ...s, input: '' }))
-  }, [activeRoom, rooms, appendMessageToRoom, updateRoomState, sendTypingIndicator])
+  }, [activeRoom, rooms, appendMessageToRoom, updateRoomState, sendTypingIndicator, keyRefs, peerMeshRef, nickname])
 
   const leaveRoom = useCallback((roomName) => {
     const room = roomName || activeRoom
@@ -735,29 +538,14 @@ function App() {
 
     client.send('leave', room, null)
 
-    // Cleanup P2P for this room
-    const mesh = peerMeshRef.current.get(room)
-    if (mesh) {
-      mesh.closeAll()
-      peerMeshRef.current.delete(room)
-    }
-    prevPeerCountRef.current.delete(room)
-    keyRefs.current.delete(room)
+    cleanupMeshRoom(room)
+    removeRoom(room)
 
-    // Remove room from state
-    setRooms(prev => {
-      const next = new Map(prev)
-      next.delete(room)
-      return next
-    })
-
-    // If leaving the active room, switch to another or go to join view
     if (room === activeRoom) {
       const remainingRooms = [...rooms.keys()].filter(r => r !== room)
       if (remainingRooms.length > 0) {
         setActiveRoom(remainingRooms[0])
       } else {
-        // Last room — full cleanup
         intentionalDisconnectRef.current = true
         client.disconnect()
         destroyAssembler()
@@ -778,22 +566,7 @@ function App() {
         window.location.hash = ''
       }
     }
-  }, [activeRoom, rooms, destroyAssembler, stopRotation, clearTyping, resetProgress])
-
-  const switchRoom = useCallback((roomName) => {
-    setActiveRoom(roomName)
-    // Clear unread count
-    updateRoomState(roomName, (s) => ({ ...s, unreadCount: 0 }))
-    // Sync keyRef for hooks
-    activeKeyRef.current = keyRefs.current.get(roomName) || null
-  }, [updateRoomState])
-
-  // Set local video element when stream changes
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream
-    }
-  }, [localStream])
+  }, [activeRoom, rooms, destroyAssembler, stopRotation, clearTyping, resetProgress, cleanupMeshRoom, removeRoom, setActiveRoom, setView, setStatus])
 
   if (view === 'join') {
     return (
@@ -803,6 +576,7 @@ function App() {
         passphrase={passphrase} setPassphrase={setPassphrase}
         ttl={ttl} setTtl={setTtl}
         onJoin={handleJoinRoom} status={status}
+        onRandomizeName={() => setJoinRoom(generateRoomName())}
       />
     )
   }
@@ -865,6 +639,7 @@ function App() {
       callMuted={callMuted}
       callVideoOff={callVideoOff}
       localVideoRef={localVideoRef}
+      localStream={localStream}
     />
   )
 }

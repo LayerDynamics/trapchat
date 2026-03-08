@@ -1,10 +1,7 @@
 import { processJob } from './worker.js';
+import { logger } from './logger.js';
 
 const POLL_INTERVAL = 500;
-const logger = {
-  info: (msg, data) => console.log(JSON.stringify({ level: 'info', msg, ...data, time: new Date().toISOString() })),
-  error: (msg, data) => console.log(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
-};
 
 export class WorkerManager {
   #queue;

@@ -1,5 +1,28 @@
+function buildIceServers() {
+  const servers = []
+
+  // STUN servers (configurable, with fallback defaults)
+  const stunUrls = import.meta.env.VITE_STUN_URLS
+    ? import.meta.env.VITE_STUN_URLS.split(',').map(s => s.trim())
+    : ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']
+  servers.push({ urls: stunUrls })
+
+  // TURN server (optional, required for symmetric NAT traversal)
+  const turnUrl = import.meta.env.VITE_TURN_URL
+  if (turnUrl) {
+    servers.push({
+      urls: turnUrl,
+      username: import.meta.env.VITE_TURN_USERNAME || '',
+      credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
+    })
+  }
+
+  return servers
+}
+
 const RTC_CONFIG = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  iceServers: buildIceServers(),
+  iceTransportPolicy: import.meta.env.VITE_ICE_TRANSPORT_POLICY || 'all',
 }
 
 export class PeerConnection {
@@ -38,17 +61,7 @@ export class PeerConnection {
 
     this.#dc = this.#pc.createDataChannel('trapchat', { ordered: true })
     this.#setupDataChannel(this.#dc)
-
-    // Auto-renegotiate when tracks are added/removed
-    this.#pc.onnegotiationneeded = async () => {
-      try {
-        const offer = await this.#pc.createOffer()
-        await this.#pc.setLocalDescription(offer)
-        this.#sendSignal({ signalType: 'offer', data: this.#pc.localDescription })
-      } catch (err) {
-        console.error('Renegotiation failed:', err)
-      }
-    }
+    this.#setupNegotiationHandling()
 
     const offer = await this.#pc.createOffer()
     await this.#pc.setLocalDescription(offer)
@@ -66,15 +79,7 @@ export class PeerConnection {
         this.#setupDataChannel(this.#dc)
       }
 
-      this.#pc.onnegotiationneeded = async () => {
-        try {
-          const offer = await this.#pc.createOffer()
-          await this.#pc.setLocalDescription(offer)
-          this.#sendSignal({ signalType: 'offer', data: this.#pc.localDescription })
-        } catch (err) {
-          console.error('Renegotiation failed:', err)
-        }
-      }
+      this.#setupNegotiationHandling()
     }
 
     await this.#pc.setRemoteDescription(new RTCSessionDescription(sdp))
@@ -99,14 +104,23 @@ export class PeerConnection {
       this.#pendingCandidates.push(candidate)
       return
     }
-    await this.#pc.addIceCandidate(new RTCIceCandidate(candidate))
+    try {
+      await this.#pc.addIceCandidate(new RTCIceCandidate(candidate))
+    } catch (err) {
+      console.warn('failed to add ICE candidate:', err)
+    }
   }
 
   async #flushPendingCandidates() {
-    for (const candidate of this.#pendingCandidates) {
-      await this.#pc.addIceCandidate(new RTCIceCandidate(candidate))
-    }
+    const candidates = this.#pendingCandidates
     this.#pendingCandidates = []
+    for (const candidate of candidates) {
+      try {
+        await this.#pc.addIceCandidate(new RTCIceCandidate(candidate))
+      } catch (err) {
+        console.warn('failed to add ICE candidate:', err)
+      }
+    }
   }
 
   /**
@@ -154,6 +168,18 @@ export class PeerConnection {
       this.#pc = null
     }
     this.onDisconnected?.()
+  }
+
+  #setupNegotiationHandling() {
+    this.#pc.onnegotiationneeded = async () => {
+      try {
+        const offer = await this.#pc.createOffer()
+        await this.#pc.setLocalDescription(offer)
+        this.#sendSignal({ signalType: 'offer', data: this.#pc.localDescription })
+      } catch (err) {
+        console.error('Renegotiation failed:', err)
+      }
+    }
   }
 
   #setupIceHandling() {

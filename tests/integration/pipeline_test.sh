@@ -3,12 +3,19 @@ set -euo pipefail
 
 # E2E pipeline integration test
 # Starts gateway + worker, submits jobs, polls results, verifies dead-letters, cleans up
+# Requires: curl, jq
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 GATEWAY_PORT=18080
 WORKER_PORT=19100
+
+# Verify jq is available
+if ! command -v jq &>/dev/null; then
+  echo "FAIL: jq is required but not installed"
+  exit 1
+fi
 
 cleanup() {
   echo "cleaning up..."
@@ -50,7 +57,7 @@ wait_for_health "$WORKER_URL" "worker"
 
 # Test 1: Gateway health
 echo "--- Test 1: Gateway health ---"
-STATUS=$(curl -sf "$GATEWAY_URL/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+STATUS=$(curl -sf "$GATEWAY_URL/health" | jq -r '.status')
 if [ "$STATUS" != "ok" ]; then
   echo "FAIL: gateway health check"
   exit 1
@@ -59,7 +66,7 @@ echo "PASS: gateway health"
 
 # Test 2: Worker health
 echo "--- Test 2: Worker health ---"
-STATUS=$(curl -sf "$WORKER_URL/health" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+STATUS=$(curl -sf "$WORKER_URL/health" | jq -r '.status')
 if [ "$STATUS" != "ok" ]; then
   echo "FAIL: worker health check"
   exit 1
@@ -68,7 +75,7 @@ echo "PASS: worker health"
 
 # Test 3: Empty rooms list
 echo "--- Test 3: Empty rooms list ---"
-ROOM_COUNT=$(curl -sf "$GATEWAY_URL/api/rooms" | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
+ROOM_COUNT=$(curl -sf "$GATEWAY_URL/api/rooms" | jq -r '.count')
 if [ "$ROOM_COUNT" != "0" ]; then
   echo "FAIL: expected 0 rooms, got $ROOM_COUNT"
   exit 1
@@ -81,7 +88,7 @@ PAYLOAD=$(echo -n "hello world test" | base64)
 JOB_RESP=$(curl -sf -X POST "$WORKER_URL/jobs" \
   -H "Content-Type: application/json" \
   -d "{\"type\":\"media:chunk\",\"data\":{\"payload\":\"$PAYLOAD\",\"chunkSize\":5,\"roomId\":\"test\"}}")
-JOB_ID=$(echo "$JOB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+JOB_ID=$(echo "$JOB_RESP" | jq -r '.id // empty')
 if [ -z "$JOB_ID" ]; then
   echo "FAIL: no job ID returned"
   exit 1
@@ -92,7 +99,7 @@ echo "PASS: job submitted ($JOB_ID)"
 echo "--- Test 5: Poll job result ---"
 MAX_RETRIES=10
 for i in $(seq 1 $MAX_RETRIES); do
-  JOB_STATUS=$(curl -sf "$WORKER_URL/jobs/$JOB_ID" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+  JOB_STATUS=$(curl -sf "$WORKER_URL/jobs/$JOB_ID" | jq -r '.status // empty' 2>/dev/null || echo "")
   if [ "$JOB_STATUS" = "completed" ]; then
     break
   fi
@@ -109,11 +116,11 @@ echo "--- Test 6: Submit invalid job + verify dead-letter ---"
 BOGUS_RESP=$(curl -sf -X POST "$WORKER_URL/jobs" \
   -H "Content-Type: application/json" \
   -d '{"type":"bogus","data":{}}')
-BOGUS_ID=$(echo "$BOGUS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+BOGUS_ID=$(echo "$BOGUS_RESP" | jq -r '.id // empty')
 
 # Wait for retries to exhaust (3 attempts with backoff)
 for i in $(seq 1 10); do
-  DL_COUNT=$(curl -sf "$WORKER_URL/dead-letters" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('deadLetters',[]))) " 2>/dev/null || echo 0)
+  DL_COUNT=$(curl -sf "$WORKER_URL/dead-letters" | jq '.deadLetters | length' 2>/dev/null || echo 0)
   [ "$DL_COUNT" -gt 0 ] && break
   sleep 1
 done
@@ -124,11 +131,7 @@ if [ "$DL_COUNT" -lt 1 ]; then
 fi
 
 # Verify the bogus job is in dead letters
-DL_HAS_BOGUS=$(curl -sf "$WORKER_URL/dead-letters" | python3 -c "
-import sys,json
-dl = json.load(sys.stdin).get('deadLetters',[])
-print('yes' if any(j.get('type')=='bogus' for j in dl) else 'no')
-")
+DL_HAS_BOGUS=$(curl -sf "$WORKER_URL/dead-letters" | jq -r 'if (.deadLetters // [] | map(select(.type == "bogus")) | length) > 0 then "yes" else "no" end')
 if [ "$DL_HAS_BOGUS" != "yes" ]; then
   echo "FAIL: bogus job not found in dead-letter queue"
   exit 1

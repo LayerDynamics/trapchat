@@ -13,6 +13,7 @@ import (
 
 func TestHandleRoomsRequiresGet(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	req := httptest.NewRequest(http.MethodPost, "/api/rooms", nil)
 	w := httptest.NewRecorder()
 	srv.handleRooms(w, req)
@@ -23,6 +24,7 @@ func TestHandleRoomsRequiresGet(t *testing.T) {
 
 func TestHandleRoomsReturnsEmptyList(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	req := httptest.NewRequest(http.MethodGet, "/api/rooms", nil)
 	w := httptest.NewRecorder()
 	srv.handleRooms(w, req)
@@ -44,6 +46,7 @@ func TestHandleRoomsReturnsEmptyList(t *testing.T) {
 
 func TestHandleRoomsWithData(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	srv.store.Join("test-room", "peer1")
 	srv.store.Join("test-room", "peer2")
 
@@ -61,6 +64,7 @@ func TestHandleRoomsWithData(t *testing.T) {
 
 func TestHandleRoomInfo(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	srv.store.Join("myroom", "peer1")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/rooms/myroom/info", nil)
@@ -82,6 +86,7 @@ func TestHandleRoomInfo(t *testing.T) {
 
 func TestHandleRoomCleanup(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	srv.store.Join("stale-room", "peer1")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/rooms/stale-room/cleanup", nil)
@@ -100,6 +105,7 @@ func TestHandleRoomCleanup(t *testing.T) {
 
 func TestAuthEnforcement(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	srv.authToken = "secret-token"
 
 	// No auth header
@@ -161,6 +167,7 @@ func TestSubmitJobSendsCorrectPost(t *testing.T) {
 	defer ts.Close()
 
 	srv := NewServer()
+	defer srv.stop()
 	srv.workerURL = ts.URL
 
 	err := srv.submitJob("room:cleanup", map[string]interface{}{
@@ -176,6 +183,7 @@ func TestSubmitJobSendsCorrectPost(t *testing.T) {
 
 func TestSignEnvelopeProducesSignature(t *testing.T) {
 	srv := NewServer()
+	defer srv.stop()
 	env := &Envelope{
 		ID:        "peer1",
 		Type:      "chat",

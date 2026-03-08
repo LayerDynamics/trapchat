@@ -16,10 +16,9 @@ const FRAME_TYPE_EVENT: u8 = 2;
 
 /// Relay-specific error types.
 #[derive(Debug, thiserror::Error)]
-#[allow(clippy::result_large_err)]
 enum RelayError {
     #[error("websocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -37,15 +36,19 @@ enum RelayError {
     Frame(#[from] trapchat_io::IoError),
 }
 
+impl From<tokio_tungstenite::tungstenite::Error> for RelayError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        RelayError::WebSocket(Box::new(e))
+    }
+}
+
 /// Encode a Message into a Frame for structured logging or binary transport.
-#[allow(clippy::result_large_err)]
 fn frame_message(msg: &Message) -> Result<Frame, RelayError> {
     let payload = serde_json::to_vec(msg)?;
     Ok(Frame::new(FRAME_TYPE_MESSAGE, payload))
 }
 
 /// Encode a RoomEvent into a Frame for structured logging or binary transport.
-#[allow(clippy::result_large_err)]
 fn frame_event(event: &RoomEvent) -> Result<Frame, RelayError> {
     let payload = serde_json::to_vec(event)?;
     Ok(Frame::new(FRAME_TYPE_EVENT, payload))
@@ -63,6 +66,10 @@ const MAX_CONN_PER_IP_PER_SEC: usize = 10;
 const MAX_RATE_LIMITER_IPS: usize = 100_000;
 /// Maximum room name length in Unicode scalar values.
 const MAX_ROOM_NAME_LEN: usize = 64;
+
+const MAX_PAYLOAD_BYTES: usize = 256 * 1024; // 256KB per payload
+/// Maximum peers per room to prevent fan-out amplification.
+const MAX_PEERS_PER_ROOM: usize = 50;
 
 /// Validate room name: must be non-empty, within length limit, and contain only
 /// letters, numbers, spaces, hyphens, underscores, and dots (matching gateway rules).
@@ -108,9 +115,14 @@ impl IpRateLimiter {
         true
     }
 
-    /// Remove entries with no recent timestamps to prevent unbounded growth.
+    /// Remove stale timestamps and entries with no recent activity.
     fn prune(&mut self) {
-        self.buckets.retain(|_, v| !v.is_empty());
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(1);
+        self.buckets.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < window);
+            !v.is_empty()
+        });
     }
 }
 
@@ -206,12 +218,11 @@ async fn main() {
         let allowed_origins = Arc::clone(&allowed_origins);
         tokio::spawn(async move {
             handle_connection(stream, rooms, &allowed_origins).await;
-            conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            conn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
     }
 }
 
-#[allow(clippy::result_large_err)]
 async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowed_origins: &[String]) {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
@@ -264,7 +275,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                     warn!("oversized message from {} ({} bytes), dropping", peer_id, data.len());
                     continue;
                 }
-                let decoded: Message = match serde_json::from_slice(&data) {
+                let mut decoded: Message = match serde_json::from_slice(&data) {
                     Ok(m) => m,
                     Err(e) => {
                         let proto_err = ProtocolError::Serialization(e);
@@ -272,6 +283,36 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                         continue;
                     }
                 };
+
+                // Validate required fields
+                if let Err(e) = decoded.validate() {
+                    warn!("from {}: {}", peer_id, e);
+                    let err = Message::new(
+                        MessageType::Error,
+                        decoded.room.clone(),
+                        Some(e.to_string()),
+                    );
+                    if let Ok(data) = serde_json::to_string(&err) {
+                        let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
+                    }
+                    continue;
+                }
+
+                // Reject oversized payloads before fan-out amplification
+                if let Some(ref p) = decoded.payload {
+                    if p.len() > MAX_PAYLOAD_BYTES {
+                        warn!("oversized payload from {} ({} bytes), dropping", peer_id, p.len());
+                        let err = Message::new(
+                            MessageType::Error,
+                            decoded.room.clone(),
+                            Some(format!("payload exceeds {}KB limit", MAX_PAYLOAD_BYTES / 1024)),
+                        );
+                        if let Ok(data) = serde_json::to_string(&err) {
+                            let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
+                        }
+                        continue;
+                    }
+                }
 
                 // Validate room name for types that reference a room
                 match decoded.msg_type {
@@ -292,6 +333,19 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                     }
                     _ => {}
                 }
+
+                // Overwrite client-supplied timestamp with server time
+                decoded.timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let data = match serde_json::to_vec(&decoded) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("failed to re-serialize message from {}: {}", peer_id, e);
+                        continue;
+                    }
+                };
 
                 match decoded.msg_type {
                     MessageType::Join => {
@@ -333,6 +387,18 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                         };
                         {
                             let mut room = room_arc.write().await;
+                            if room.len() >= MAX_PEERS_PER_ROOM && !room.contains_key(&peer_id) {
+                                warn!("room {} full ({} peers), rejecting {}", room_name, room.len(), peer_id);
+                                let err = Message::new(
+                                    MessageType::Error,
+                                    room_name.clone(),
+                                    Some(format!("room full — max {} peers", MAX_PEERS_PER_ROOM)),
+                                );
+                                if let Ok(data) = serde_json::to_string(&err) {
+                                    let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
+                                }
+                                continue;
+                            }
                             room.insert(peer_id.clone(), tx.clone());
                         }
                         current_room = Some(room_name.clone());
@@ -360,9 +426,21 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
                             current_room = None;
                         }
                     }
-                    MessageType::Presence | MessageType::Error => {}
+                    MessageType::Presence | MessageType::Error | MessageType::Welcome => {
+                        let proto_err = ProtocolError::InvalidMessageType(format!("{:?}", decoded.msg_type));
+                        warn!("from {}: {}", peer_id, proto_err);
+                        let err = Message::new(
+                            MessageType::Error,
+                            decoded.room.clone(),
+                            Some(proto_err.to_string()),
+                        );
+                        if let Ok(data) = serde_json::to_string(&err) {
+                            let _ = tx.try_send(tokio_tungstenite::tungstenite::Message::Text(data));
+                        }
+                    }
                     _ => {
-                        warn!("unhandled message type from {}: {:?}", peer_id, decoded.msg_type);
+                        let proto_err = ProtocolError::InvalidMessageType(format!("{:?}", decoded.msg_type));
+                        warn!("from {}: {}", peer_id, proto_err);
                     }
                 }
             }

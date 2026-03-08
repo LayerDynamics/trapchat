@@ -1,31 +1,50 @@
 import { createServer } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import { Queue } from './queue.js';
 import { WorkerManager } from './manager.js';
 
-const logger = {
-  info: (msg, data) => console.log(JSON.stringify({ level: 'info', msg, ...data, time: new Date().toISOString() })),
-  warn: (msg, data) => console.log(JSON.stringify({ level: 'warn', msg, ...data, time: new Date().toISOString() })),
-  error: (msg, data) => console.log(JSON.stringify({ level: 'error', msg, ...data, time: new Date().toISOString() })),
-};
+import { logger } from './logger.js';
 
 const PORT = process.env.WORKER_PORT || 9100;
 const MAX_RESULTS = 1000;
 const MAX_SUBMITTED_JOBS = 10000;
 const AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || '';
 
+// Rate limiting for job submission
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 60;  // 60 jobs per minute per IP
+const MAX_RATE_LIMIT_IPS = 10_000;
+const rateLimitMap = new Map(); // ip -> { count, resetAt }
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateLimitMap.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitMap.set(ip, entry);
+  }
+  entry.count++;
+  // Evict oldest entries if map grows too large
+  if (rateLimitMap.size > MAX_RATE_LIMIT_IPS) {
+    const firstKey = rateLimitMap.keys().next().value;
+    rateLimitMap.delete(firstKey);
+  }
+  return entry.count <= RATE_LIMIT_MAX_REQUESTS;
+}
+
 function checkAuth(req, res) {
   if (!AUTH_TOKEN) return true; // no auth configured — dev mode
   const header = req.headers['authorization'] || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const tokenBuf = Buffer.from(token);
-  const authBuf = Buffer.from(AUTH_TOKEN);
-  if (!token || tokenBuf.length !== authBuf.length) {
+  if (!token) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return false;
   }
-  if (!timingSafeEqual(tokenBuf, authBuf)) {
+  // Hash both to fixed length so timingSafeEqual doesn't leak token length
+  const tokenHash = createHash('sha256').update(token).digest();
+  const authHash = createHash('sha256').update(AUTH_TOKEN).digest();
+  if (!timingSafeEqual(tokenHash, authHash)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return false;
@@ -99,6 +118,12 @@ const server = createServer((req, res) => {
   if (!checkAuth(req, res)) return;
 
   if (url.pathname === '/jobs' && req.method === 'POST') {
+    const ip = req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(ip)) {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate limit exceeded' }));
+      return;
+    }
     const MAX_BODY = 1024 * 1024; // 1MB
     let body = '';
     let overflow = false;

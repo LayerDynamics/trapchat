@@ -9,6 +9,7 @@ services:
       - GATEWAY_PORT=8080
       - RELAY_URL=ws://relay:9000
       - WORKER_URL=http://worker:9100
+      - WORKER_AUTH_TOKEN=${WORKER_AUTH_TOKEN:?Set WORKER_AUTH_TOKEN in .env}
     restart: unless-stopped
     depends_on:
       relay:
@@ -50,6 +51,7 @@ services:
       - "9100"
     environment:
       - WORKER_PORT=9100
+      - WORKER_AUTH_TOKEN=${WORKER_AUTH_TOKEN:?Set WORKER_AUTH_TOKEN in .env}
       - ALLOWED_CALLBACK_HOSTS=localhost,127.0.0.1,gateway
       - ALLOWED_GATEWAY_HOSTS=localhost,127.0.0.1,gateway
     restart: unless-stopped

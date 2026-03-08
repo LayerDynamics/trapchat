@@ -12,6 +12,7 @@ type Room struct {
 	LastActivity time.Time
 	TTLSeconds   int64
 	CreatedAt    time.Time
+	Salt         []byte
 }
 
 // Store is a thread-safe in-memory room registry.
@@ -27,13 +28,14 @@ func NewStore() *Store {
 
 // Join adds a peer to a room, creating the room if needed. Returns peer count.
 func (s *Store) Join(room, peerID string) int {
-	count, _ := s.JoinWithTTL(room, peerID, 0)
+	count, _ := s.JoinWithTTL(room, peerID, 0, nil)
 	return count
 }
 
 // JoinWithTTL atomically joins a room (creating it if needed) and sets TTL on new rooms.
 // Returns (peerCount, isNewRoom). TTL is only applied when ttlSeconds > 0 and room is new.
-func (s *Store) JoinWithTTL(room, peerID string, ttlSeconds int64) (int, bool) {
+// Salt is stored only on new room creation (first-writer-wins); subsequent joins ignore salt.
+func (s *Store) JoinWithTTL(room, peerID string, ttlSeconds int64, salt []byte) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -44,6 +46,10 @@ func (s *Store) JoinWithTTL(room, peerID string, ttlSeconds int64) (int, bool) {
 		if ttlSeconds > 0 {
 			r.TTLSeconds = ttlSeconds
 		}
+		if len(salt) > 0 {
+			r.Salt = make([]byte, len(salt))
+			copy(r.Salt, salt)
+		}
 		s.rooms[room] = r
 	}
 	if _, exists := r.Peers[peerID]; !exists {
@@ -51,6 +57,20 @@ func (s *Store) JoinWithTTL(room, peerID string, ttlSeconds int64) (int, bool) {
 	}
 	r.LastActivity = time.Now()
 	return len(r.Peers), isNew
+}
+
+// RoomSalt returns the salt for a room, or nil if none is set or room doesn't exist.
+func (s *Store) RoomSalt(room string) []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	r, ok := s.rooms[room]
+	if !ok || len(r.Salt) == 0 {
+		return nil
+	}
+	dst := make([]byte, len(r.Salt))
+	copy(dst, r.Salt)
+	return dst
 }
 
 // Leave removes a peer from a room. Returns remaining count.
