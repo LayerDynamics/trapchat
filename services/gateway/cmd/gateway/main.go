@@ -189,9 +189,9 @@ type relayInstance struct {
 type Server struct {
 	store    *storage.Store
 	upgrader websocket.Upgrader
-	connMu   sync.RWMutex
-	conns    map[string]*peer
-	peerRooms map[string]string
+	connMu    sync.RWMutex
+	conns     map[string]*peer
+	peerRooms map[string]map[string]bool // peerID -> set of room names (max protocol.MaxRooms)
 
 	relayURL  string
 	relayConn *websocket.Conn
@@ -260,7 +260,7 @@ func NewServer() *Server {
 			},
 		},
 		conns:     make(map[string]*peer),
-		peerRooms: make(map[string]string),
+		peerRooms: make(map[string]map[string]bool),
 		// 10 messages per second, burst of 20
 		rl:        newRateLimiter(10, time.Second, 20),
 		typingRL:  newRateLimiter(1, 2*time.Second, 3),
@@ -539,15 +539,27 @@ func (s *Server) ttlExpiryLoop() {
 				s.connMu.Lock()
 				p, ok := s.conns[pid]
 				if ok {
-					delete(s.conns, pid)
-					delete(s.peerRooms, pid)
+					// Remove this room from peer's room set
+					if rooms := s.peerRooms[pid]; rooms != nil {
+						delete(rooms, roomName)
+						if len(rooms) == 0 {
+							delete(s.peerRooms, pid)
+							delete(s.conns, pid)
+						}
+					}
 				}
 				s.connMu.Unlock()
 
+				s.store.Leave(roomName, pid)
+				// Only close connection if peer has no remaining rooms
 				if ok {
-					s.store.Leave(roomName, pid)
-					p.closeSend()
-					p.conn.Close()
+					s.connMu.RLock()
+					_, stillActive := s.conns[pid]
+					s.connMu.RUnlock()
+					if !stillActive {
+						p.closeSend()
+						p.conn.Close()
+					}
 				}
 			}
 			// Force cleanup any remaining state
@@ -803,15 +815,25 @@ func (s *Server) handleRoomSub(w http.ResponseWriter, r *http.Request) {
 			s.connMu.Lock()
 			p, ok := s.conns[pid]
 			if ok {
-				delete(s.conns, pid)
-				delete(s.peerRooms, pid)
+				if rooms := s.peerRooms[pid]; rooms != nil {
+					delete(rooms, roomName)
+					if len(rooms) == 0 {
+						delete(s.peerRooms, pid)
+						delete(s.conns, pid)
+					}
+				}
 			}
 			s.connMu.Unlock()
 
+			s.store.Leave(roomName, pid)
 			if ok {
-				s.store.Leave(roomName, pid)
-				p.closeSend()
-				p.conn.Close()
+				s.connMu.RLock()
+				_, stillActive := s.conns[pid]
+				s.connMu.RUnlock()
+				if !stillActive {
+					p.closeSend()
+					p.conn.Close()
+				}
 			}
 		}
 		// If room still exists with 0 peers (stale tracking), force remove via Leave with dummy
@@ -926,12 +948,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.typingRL.remove(peerID)
 		s.signalRL.remove(peerID)
 		s.connMu.Lock()
-		room := s.peerRooms[peerID]
+		rooms := s.peerRooms[peerID]
 		delete(s.conns, peerID)
 		delete(s.peerRooms, peerID)
 		s.connMu.Unlock()
 
-		if room != "" {
+		for room := range rooms {
 			s.store.Leave(room, peerID)
 			s.broadcastPresence(room)
 			s.forwardToRelay(protocol.Envelope{
@@ -984,7 +1006,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Validate room name for types that require one
-		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia || env.Type == protocol.TypeTyping || env.Type == protocol.TypeReceipt || env.Type == protocol.TypeKeyRotation || env.Type == protocol.TypeSignal {
+		if env.Type == protocol.TypeJoin || env.Type == protocol.TypeLeave || env.Type == protocol.TypeChat || env.Type == protocol.TypeMedia || env.Type == protocol.TypeTyping || env.Type == protocol.TypeReceipt || env.Type == protocol.TypeKeyRotation || env.Type == protocol.TypeSignal || env.Type == protocol.TypeCallOffer || env.Type == protocol.TypeCallAnswer || env.Type == protocol.TypeCallEnd {
 			if reason := validateRoomName(env.Room); reason != "" {
 				s.sendError(p, reason)
 				continue
@@ -996,6 +1018,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Pre-check room limit (still slightly racy but JoinWithTTL is atomic for room+TTL)
 			if s.store.Count(env.Room) == 0 && s.store.RoomCount() >= maxRooms {
 				s.sendError(p, "room limit reached — try again later")
+				continue
+			}
+
+			// Enforce per-peer multi-room limit
+			s.connMu.RLock()
+			currentRooms := s.peerRooms[peerID]
+			alreadyIn := currentRooms != nil && currentRooms[env.Room]
+			roomCount := len(currentRooms)
+			s.connMu.RUnlock()
+			if !alreadyIn && roomCount >= protocol.MaxRooms {
+				s.sendError(p, fmt.Sprintf("max %d rooms — leave one first", protocol.MaxRooms))
 				continue
 			}
 
@@ -1012,16 +1045,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				ttlForJoin = jp.TTLSeconds
 			}
 
-			// Atomically read previous room and update mapping
+			// Add room to peer's room set
 			s.connMu.Lock()
-			prevRoom := s.peerRooms[peerID]
-			s.peerRooms[peerID] = env.Room
-			s.connMu.Unlock()
-
-			if prevRoom != "" && prevRoom != env.Room {
-				s.store.Leave(prevRoom, peerID)
-				s.broadcastPresence(prevRoom)
+			if s.peerRooms[peerID] == nil {
+				s.peerRooms[peerID] = make(map[string]bool)
 			}
+			s.peerRooms[peerID][env.Room] = true
+			s.connMu.Unlock()
 
 			// Atomic join + TTL — eliminates TOCTOU race and TTL gap
 			s.store.JoinWithTTL(env.Room, peerID, ttlForJoin)
@@ -1032,6 +1062,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 			s.broadcastPresence(env.Room)
+			s.sendRoomList(p, peerID)
 			s.forwardToRelay(protocol.Envelope{
 				Type:      protocol.TypeJoin,
 				Room:      env.Room,
@@ -1042,9 +1073,15 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case protocol.TypeLeave:
 			s.store.Leave(env.Room, peerID)
 			s.connMu.Lock()
-			delete(s.peerRooms, peerID)
+			if rooms := s.peerRooms[peerID]; rooms != nil {
+				delete(rooms, env.Room)
+				if len(rooms) == 0 {
+					delete(s.peerRooms, peerID)
+				}
+			}
 			s.connMu.Unlock()
 			s.broadcastPresence(env.Room)
+			s.sendRoomList(p, peerID)
 			s.forwardToRelay(protocol.Envelope{
 				Type:      protocol.TypeLeave,
 				Room:      env.Room,
@@ -1058,49 +1095,47 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			s.connMu.RLock()
-			inRoom := s.peerRooms[peerID]
+			rooms := s.peerRooms[peerID]
+			inTargetRoom := rooms != nil && rooms[env.Room]
 			s.connMu.RUnlock()
-			if inRoom == "" {
+			if !inTargetRoom {
 				s.sendError(p, "must join a room before sending messages")
 				continue
 			}
-			// Override client-supplied room with the server-authoritative room
-			// to prevent broadcasting to a room the peer hasn't joined.
-			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
-			s.broadcast(inRoom, env, peerID)
+			s.broadcast(env.Room, env, peerID)
 			s.forwardToRelay(env)
 
 		case protocol.TypeTyping:
 			s.connMu.RLock()
-			inRoom := s.peerRooms[peerID]
+			rooms := s.peerRooms[peerID]
+			inTargetRoom := rooms != nil && rooms[env.Room]
 			s.connMu.RUnlock()
-			if inRoom == "" {
+			if !inTargetRoom {
 				s.sendError(p, "must join a room before sending typing")
 				continue
 			}
 			if !s.typingRL.allow(peerID) {
 				continue // silently drop excess typing indicators
 			}
-			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
 			// Typing indicators are NOT forwarded to relay — local gateway only
-			s.broadcast(inRoom, env, peerID)
+			s.broadcast(env.Room, env, peerID)
 
 		case protocol.TypeReceipt:
 			s.connMu.RLock()
-			inRoom := s.peerRooms[peerID]
+			rooms := s.peerRooms[peerID]
+			inTargetRoom := rooms != nil && rooms[env.Room]
 			s.connMu.RUnlock()
-			if inRoom == "" {
+			if !inTargetRoom {
 				s.sendError(p, "must join a room before sending receipts")
 				continue
 			}
-			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
-			s.broadcast(inRoom, env, peerID)
+			s.broadcast(env.Room, env, peerID)
 
 		case protocol.TypeKeyRotation:
 			if !s.rl.allow(peerID) {
@@ -1108,48 +1143,55 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			s.connMu.RLock()
-			inRoom := s.peerRooms[peerID]
+			rooms := s.peerRooms[peerID]
+			inTargetRoom := rooms != nil && rooms[env.Room]
 			s.connMu.RUnlock()
-			if inRoom == "" {
+			if !inTargetRoom {
 				s.sendError(p, "must join a room before sending key rotation")
 				continue
 			}
-			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
-			s.broadcast(inRoom, env, peerID)
+			s.broadcast(env.Room, env, peerID)
 			s.forwardToRelay(env)
 
-		case protocol.TypeSignal:
+		case protocol.TypeSignal, protocol.TypeCallOffer, protocol.TypeCallAnswer, protocol.TypeCallEnd:
 			s.connMu.RLock()
-			inRoom := s.peerRooms[peerID]
+			rooms := s.peerRooms[peerID]
+			inTargetRoom := rooms != nil && rooms[env.Room]
 			s.connMu.RUnlock()
-			if inRoom == "" {
+			if !inTargetRoom {
 				s.sendError(p, "must join a room before sending signals")
 				continue
 			}
-			if !s.signalRL.allow(peerID) {
+			if env.Type == protocol.TypeSignal && !s.signalRL.allow(peerID) {
 				continue // silently drop excess signals
 			}
-			if env.To == "" {
+			if env.Type == protocol.TypeSignal && env.To == "" {
 				s.sendError(p, "signal requires target peer")
 				continue
 			}
-			env.Room = inRoom
 			env.ID = peerID
 			env.Timestamp = time.Now().UnixMilli()
-			// Forward directly to target peer — must be in the same room
-			s.connMu.RLock()
-			targetPeer, ok := s.conns[env.To]
-			targetRoom := s.peerRooms[env.To]
-			s.connMu.RUnlock()
-			if ok && targetRoom == inRoom {
-				data, err := json.Marshal(env)
-				if err == nil {
-					targetPeer.enqueue(data)
+			if env.To != "" {
+				// Forward directly to target peer — must be in the same room
+				s.connMu.RLock()
+				targetPeer, ok := s.conns[env.To]
+				targetRooms := s.peerRooms[env.To]
+				targetInRoom := targetRooms != nil && targetRooms[env.Room]
+				s.connMu.RUnlock()
+				if ok && targetInRoom {
+					data, err := json.Marshal(env)
+					if err == nil {
+						targetPeer.enqueue(data)
+					}
+				} else {
+					// Target peer not on this instance — forward to relay for cross-gateway delivery
+					s.forwardToRelay(env)
 				}
 			} else {
-				// Target peer not on this instance — forward to relay for cross-gateway delivery
+				// Broadcast call signals to all peers in room
+				s.broadcast(env.Room, env, peerID)
 				s.forwardToRelay(env)
 			}
 
@@ -1264,6 +1306,32 @@ func (s *Server) broadcast(room string, env protocol.Envelope, excludePeerID str
 	for _, p := range targets {
 		p.enqueue(data)
 	}
+}
+
+// sendRoomList sends the current list of joined rooms to a peer.
+func (s *Server) sendRoomList(p *peer, peerID string) {
+	s.connMu.RLock()
+	rooms := s.peerRooms[peerID]
+	roomList := make([]string, 0, len(rooms))
+	for r := range rooms {
+		roomList = append(roomList, r)
+	}
+	s.connMu.RUnlock()
+
+	payload, err := json.Marshal(roomList)
+	if err != nil {
+		return
+	}
+	env := protocol.Envelope{
+		Type:      protocol.TypeRoomList,
+		Payload:   string(payload),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
+	p.enqueue(data)
 }
 
 func (s *Server) broadcastPresence(room string) {
