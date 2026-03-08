@@ -1,4 +1,4 @@
-import { encryptMediaEnvelope, decryptMediaEnvelope } from './crypto.js';
+import { encrypt, decrypt, encryptBytes, decryptBytes, encryptMediaEnvelope, decryptMediaEnvelope } from './crypto.js';
 
 const CHUNK_SIZE = 512 * 1024; // 512KB raw
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
@@ -158,6 +158,15 @@ export class MediaAssembler {
     if (total > MAX_CHUNKS || total <= 0) return null;
     if (seq < 0 || seq >= total) return null;
 
+    // Decrypt the inner envelope to get data + metadata
+    let inner;
+    try {
+      const decryptedJson = await decrypt(key, chunk);
+      inner = JSON.parse(decryptedJson);
+    } catch {
+      return { error: true, transferId, message: '[encrypted media — key mismatch]' };
+    }
+
     if (!this.#transfers.has(transferId)) {
       if (this.#transfers.size >= MAX_CONCURRENT_TRANSFERS) return null;
       this.#transfers.set(transferId, {
@@ -168,6 +177,12 @@ export class MediaAssembler {
         fileName: null,
         fileSize: null,
       });
+    } else if (seq === 0 && inner.mimeType) {
+      // First chunk arrived out of order — update metadata
+      const transfer = this.#transfers.get(transferId);
+      transfer.mimeType = inner.mimeType;
+      transfer.fileName = sanitizeFileName(inner.fileName);
+      transfer.fileSize = inner.fileSize;
     }
 
     // Reset stale timeout on each chunk so large transfers on slow connections don't expire
@@ -183,6 +198,7 @@ export class MediaAssembler {
     const transfer = this.#transfers.get(transferId);
     if (transfer.chunks[seq]) return null; // duplicate
 
+    // Decrypt the actual file data bytes from the inner envelope
     let decrypted;
     let chunkMeta;
     try {

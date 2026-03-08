@@ -79,7 +79,7 @@ describe('MediaAssembler', () => {
     assembler.destroy()
   })
 
-  it('returns error on decryption failure', async () => {
+  it('returns error on decryption failure (wrong key for outer envelope)', async () => {
     const key1 = await generateRoomKey()
     const key2 = await generateRoomKey()
     const assembler = new MediaAssembler()
@@ -100,6 +100,24 @@ describe('MediaAssembler', () => {
     expect(result.fileName).not.toContain('/')
     expect(result.fileName).not.toContain('..')
     assembler.destroy()
+  })
+
+  it('outer payload contains no plaintext metadata', async () => {
+    const key = await generateRoomKey()
+    const data = new Uint8Array([1, 2, 3])
+    const chunk = await makeChunk(key, 'tx8', 0, 1, data, {
+      mimeType: 'image/png',
+      fileName: 'secret-photo.png',
+    })
+    const outer = JSON.parse(chunk.payload)
+    // Outer should only have routing fields, no plaintext metadata
+    expect(outer.mimeType).toBeUndefined()
+    expect(outer.fileName).toBeUndefined()
+    expect(outer.fileSize).toBeUndefined()
+    expect(outer).toHaveProperty('transferId')
+    expect(outer).toHaveProperty('seq')
+    expect(outer).toHaveProperty('total')
+    expect(outer).toHaveProperty('chunk')
   })
 })
 

@@ -320,6 +320,7 @@ function App() {
               peerCount: presence.count || 0,
               peerNicknames: presence.peers || current.peerNicknames,
               expiresAt: presence.expiresAt || current.expiresAt,
+              salt: presence.salt || current.salt,
             })
             return next
           })

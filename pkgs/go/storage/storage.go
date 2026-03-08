@@ -12,7 +12,7 @@ type Room struct {
 	LastActivity time.Time
 	TTLSeconds   int64
 	CreatedAt    time.Time
-	Salt         []byte
+	Salt         []byte // raw salt bytes for passphrase key derivation (first-writer-wins)
 }
 
 // Store is a thread-safe in-memory room registry.
