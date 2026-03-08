@@ -1,10 +1,16 @@
 const MAX_ROOM_NAME_LEN = 64
 
-export default function JoinView({ room, setRoom, nickname, setNickname, passphrase, setPassphrase, ttl, setTtl, onJoin, status }) {
+export default function JoinView({ room, setRoom, nickname, setNickname, passphrase, setPassphrase, ttl, setTtl, onJoin, status, isModal, onClose }) {
   return (
-    <div className="container" role="main">
-      <h1>trapchat</h1>
-      <p className="subtitle">anonymous. ephemeral. encrypted.</p>
+    <div className={isModal ? 'join-modal-inner' : 'container'} role="main">
+      {!isModal && <h1>trapchat</h1>}
+      {!isModal && <p className="subtitle">anonymous. ephemeral. encrypted.</p>}
+      {isModal && (
+        <div className="join-modal-header">
+          <h2>join another room</h2>
+          <button type="button" className="join-modal-close" onClick={onClose} aria-label="Close">&times;</button>
+        </div>
+      )}
       <form onSubmit={onJoin} className="join-form" aria-label="Join a chat room">
         <input
           type="text"
