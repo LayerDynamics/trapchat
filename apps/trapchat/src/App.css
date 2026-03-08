@@ -587,6 +587,251 @@ button {
   }
 }
 
+/* Room tabs */
+.room-tabs {
+  display: flex;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-color);
+  width: 100%;
+  box-sizing: border-box;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  flex-shrink: 0;
+}
+
+.room-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.room-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.5em 0.75em;
+  font-size: 0.85em;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.room-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+
+.room-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--bg-own-msg);
+  font-weight: 600;
+}
+
+.room-tab-close {
+  font-size: 1.1em;
+  line-height: 1;
+  opacity: 0.5;
+  cursor: pointer;
+  padding: 0 0.15em;
+}
+
+.room-tab-close:hover {
+  opacity: 1;
+  color: var(--leave-hover);
+}
+
+.add-room-tab {
+  font-size: 1.2em;
+  font-weight: 600;
+  padding: 0.5em 0.75em;
+  color: var(--text-secondary);
+}
+
+.add-room-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+}
+
+.unread-badge {
+  background: var(--bg-own-msg);
+  color: #fff;
+  font-size: 0.7em;
+  font-weight: 700;
+  min-width: 1.4em;
+  height: 1.4em;
+  border-radius: 1em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0.3em;
+}
+
+/* Call buttons in header */
+.call-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: 0.9em;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-primary);
+}
+
+.call-btn:hover {
+  background: var(--bg-secondary);
+  border-color: var(--text-secondary);
+}
+
+/* Call overlay */
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.9);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.call-videos {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 1em;
+  padding: 1em;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.remote-video {
+  max-width: 100%;
+  max-height: 60vh;
+  border-radius: 12px;
+  background: #000;
+}
+
+.local-video {
+  position: fixed;
+  bottom: 80px;
+  right: 16px;
+  width: 120px;
+  height: 90px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #000;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  z-index: 101;
+}
+
+.call-waiting {
+  color: var(--text-secondary);
+  font-size: 1.1em;
+}
+
+.call-controls {
+  display: flex;
+  gap: 1em;
+  padding: 1.5em;
+  flex-shrink: 0;
+}
+
+.call-control-btn {
+  padding: 0.75em 1.5em;
+  border-radius: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 0.9em;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.call-control-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.call-control-btn.active {
+  background: rgba(255, 255, 255, 0.25);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+.call-control-btn.end-call {
+  background: #ef4444;
+  border-color: #ef4444;
+}
+
+.call-control-btn.end-call:hover {
+  background: #dc2626;
+}
+
+/* Join modal overlay */
+.join-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.join-modal {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 1.5em;
+  max-width: 400px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.join-modal-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: var(--text-primary);
+}
+
+.join-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  margin-bottom: 1em;
+}
+
+.join-modal-header h2 {
+  margin: 0;
+  font-size: 1.2em;
+}
+
+.join-modal-close {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 1.5em;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+.join-modal-close:hover {
+  color: var(--text-primary);
+}
+
 /* Extra small screens */
 @media (max-width: 380px) {
   .room-name {
