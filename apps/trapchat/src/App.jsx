@@ -92,17 +92,17 @@ function App() {
     peerMeshBridgeRef,
   } = useCallManager({ clientRef, activeRoom })
   const callActiveRef = useRef(callActive)
-  callActiveRef.current = callActive
+  useEffect(() => { callActiveRef.current = callActive }, [callActive])
 
   // --- WebRTC Mesh ---
   const {
-    peerMeshRef, makeSignalSender,
+    peerMeshRef,
     handlePresenceMesh, handleSignal: handleWebRTCSignal,
-    cleanupRoom: cleanupMeshRoom, cleanupAll: cleanupAllMeshes,
+    cleanupRoom: cleanupMeshRoom,
   } = useWebRTCMesh({ clientRef, updateRoomState, setRemoteStreams })
 
   // Bridge peerMeshRef into call manager
-  peerMeshBridgeRef.current = peerMeshRef
+  useEffect(() => { peerMeshBridgeRef.current = peerMeshRef }, [peerMeshBridgeRef, peerMeshRef])
 
   // --- Existing hooks ---
   const { startRotation, stopRotation, handleKeyRotationMessage, decryptWithRotation } =
@@ -184,8 +184,8 @@ function App() {
 
   const endCallRef = useRef(null)
   const handleIncomingCallRef = useRef(null)
-  endCallRef.current = endCall
-  handleIncomingCallRef.current = handleIncomingCall
+  useEffect(() => { endCallRef.current = endCall }, [endCall])
+  useEffect(() => { handleIncomingCallRef.current = handleIncomingCall }, [handleIncomingCall])
 
   const setupGlobalHandlersRef = useRef(null)
 
@@ -473,7 +473,7 @@ function App() {
     }))
   }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, handlePresenceMesh, handleWebRTCSignal, setRooms, setStatus, activeRoomRef, keyRefs, roomsRef, MAX_TEXT_LENGTH])
 
-  setupGlobalHandlersRef.current = setupGlobalHandlers
+  useEffect(() => { setupGlobalHandlersRef.current = setupGlobalHandlers }, [setupGlobalHandlers])
 
   const sendMessage = useCallback(async (e) => {
     e.preventDefault()

@@ -27,7 +27,7 @@ class MockRTCPeerConnection {
   _dc = null
   _senders = []
 
-  createDataChannel(label, opts) {
+  createDataChannel(label, _opts) {
     this._dc = new MockDataChannel()
     this._dc.label = label
     return this._dc
@@ -40,7 +40,7 @@ class MockRTCPeerConnection {
   async setRemoteDescription(desc) { this._remoteDescription = desc }
   async addIceCandidate(candidate) { this._addedCandidates = (this._addedCandidates || []).concat(candidate) }
 
-  addTrack(track, stream) { this._senders.push({ track }); return { track } }
+  addTrack(track, _stream) { this._senders.push({ track }); return { track } }
   getSenders() { return this._senders }
   removeTrack(sender) { this._senders = this._senders.filter(s => s !== sender) }
   close() { this.connectionState = 'closed' }

@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import QRCode from 'qrcode'
-import { generateRoomKey, exportKey, importKey, deriveRoomKey, uint8ToBase64, base64ToUint8 } from '../lib/crypto.js'
+import { generateRoomKey, exportKey, importKey, deriveRoomKey } from '../lib/crypto.js'
 
 const MAX_MESSAGES = 500
 const MAX_ROOM_NAME_LEN = 64
@@ -19,14 +19,14 @@ function defaultRoomState() {
 export function useRoomManager() {
   const [rooms, setRooms] = useState(new Map())
   const roomsRef = useRef(rooms)
-  roomsRef.current = rooms
+  useEffect(() => { roomsRef.current = rooms }, [rooms])
   const [activeRoom, setActiveRoom] = useState('')
   const [view, setView] = useState('join')
   const [status, setStatus] = useState('disconnected')
 
   const keyRefs = useRef(new Map()) // room -> CryptoKey
   const activeRoomRef = useRef(activeRoom)
-  activeRoomRef.current = activeRoom
+  useEffect(() => { activeRoomRef.current = activeRoom }, [activeRoom])
 
   const activeKeyRef = useRef(null)
   useEffect(() => {

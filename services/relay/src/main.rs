@@ -227,6 +227,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: RoomMap, allowe
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     let allowed = allowed_origins.to_vec();
+    #[allow(clippy::result_large_err)]
     let callback = |req: &Request, response: Response| -> Result<Response, tokio_tungstenite::tungstenite::http::Response<Option<String>>> {
         if !allowed.is_empty() {
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");

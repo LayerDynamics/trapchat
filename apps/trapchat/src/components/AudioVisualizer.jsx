@@ -3,7 +3,10 @@ import { useEffect, useRef } from 'react'
 export default function AudioVisualizer({ stream, color = '#22c55e', height = 40, label }) {
   const canvasRef = useRef(null)
   const colorRef = useRef(color)
-  colorRef.current = color
+
+  useEffect(() => {
+    colorRef.current = color
+  }, [color])
 
   useEffect(() => {
     if (!stream) return

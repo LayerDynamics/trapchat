@@ -182,7 +182,7 @@ describe('sendCanvas', () => {
     const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0])
     const mockBlob = new Blob([pngBytes], { type: 'image/png' })
     const canvas = {
-      toBlob: (cb, type) => cb(mockBlob),
+      toBlob: (cb, _type) => cb(mockBlob),
     }
 
     const result = await sendCanvas(client, key, 'room1', canvas)
