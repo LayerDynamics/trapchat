@@ -110,7 +110,6 @@ export default function ChatView({
   joinModalProps,
   callActive,
   callType,
-  localStream,
   remoteStreams,
   onStartCall,
   onEndCall,
@@ -125,8 +124,9 @@ export default function ChatView({
   const [timeRemaining, setTimeRemaining] = useState(null)
   useEffect(() => {
     if (!expiresAt) {
-      setTimeRemaining(null)
-      return
+      // Reset outside the synchronous effect body via microtask
+      const t = setTimeout(() => setTimeRemaining(null), 0)
+      return () => clearTimeout(t)
     }
     const update = () => {
       const remaining = expiresAt - Date.now()

@@ -182,6 +182,7 @@ function App() {
 
   // Cleanup on unmount
   useEffect(() => {
+    const meshes = peerMeshRef.current
     return () => {
       unsubsRef.current.forEach(fn => fn())
       unsubsRef.current = []
@@ -195,7 +196,7 @@ function App() {
         observerRef.current.disconnect()
         observerRef.current = null
       }
-      for (const mesh of peerMeshRef.current.values()) {
+      for (const mesh of meshes.values()) {
         mesh.closeAll()
       }
     }
@@ -323,7 +324,7 @@ function App() {
       setStatus('error')
       console.error('connection failed:', err)
     }
-  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState])
+  }, [joinRoom, passphrase, nickname, ttl, rooms, updateRoomState, setupGlobalHandlers])
 
   const setupGlobalHandlers = useCallback((client) => {
     unsubsRef.current.forEach(fn => fn())
@@ -378,7 +379,7 @@ function App() {
                 const pc = new PeerConnection(
                   makeSignalSender(room, remotePid),
                   (msgData) => {
-                    try { client.emitP2P('message', { ...JSON.parse(msgData), room }) } catch {}
+                    try { client.emitP2P('message', { ...JSON.parse(msgData), room }) } catch { /* ignore parse errors */ }
                   }
                 )
                 pc.onConnected = () => {
@@ -390,7 +391,7 @@ function App() {
                 // Store as a simple map entry (not PeerMesh for 2-peer case)
                 const mesh = new PeerMesh({
                   onMessage: (pid, d) => {
-                    try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch {}
+                    try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch { /* ignore parse errors */ }
                   },
                   onConnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: true })),
                   onDisconnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: false })),
@@ -424,7 +425,7 @@ function App() {
           if (!mesh) {
             mesh = new PeerMesh({
               onMessage: (pid, d) => {
-                try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch {}
+                try { client.emitP2P('message', { ...JSON.parse(d), room }) } catch { /* ignore parse errors */ }
               },
               onConnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: true })),
               onDisconnected: () => updateRoomState(room, (s) => ({ ...s, isP2P: false })),
@@ -566,14 +567,14 @@ function App() {
         handleMediaChunk(data)
       }
     }))
-  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, makeSignalSender, rooms])
+  }, [startRotation, initAssembler, handleTypingMessage, handleKeyRotationMessage, handleMediaChunk, decryptWithRotation, appendMessageToRoom, updateRoomState, makeSignalSender, rooms, callActive, endCall, handleIncomingCall])
 
   const handleIncomingCall = useCallback(async (fromPeerId, room, payloadStr) => {
     let type = 'audio'
     try {
       const p = typeof payloadStr === 'string' ? JSON.parse(payloadStr) : payloadStr
       type = p?.callType || 'audio'
-    } catch {}
+    } catch { /* ignore malformed payload */ }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -856,7 +857,6 @@ function App() {
       }}
       callActive={callActive}
       callType={callType}
-      localStream={localStream}
       remoteStreams={remoteStreams}
       onStartCall={startCall}
       onEndCall={endCall}
